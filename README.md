@@ -3,8 +3,7 @@
 `wt` is a small, predictable CLI for managing **long-lived Git worktree workspaces**
 used by coding agents (Pi, Claude Code) and a solo developer.
 
-It implements the specification in [`design.md`](design.md) (also published as
-`WT_DESIGN.md`). `wt` orchestrates Git rather than reimplementing it, uses
+It implements the specification in [`design.md`](design.md). `wt` orchestrates Git rather than reimplementing it, uses
 [mikefarah/yq](https://github.com/mikefarah/yq) for TOML configuration, and is a
 single Bash script.
 

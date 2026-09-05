@@ -1295,7 +1295,7 @@ wt/
 ├── wt.sh                  # executable entry point
 ├── .wt.toml               # optional development/test project's own config
 ├── README.md
-├── WT_DESIGN.md           # this document
+├── design.md              # this document
 ├── tests/
 │   ├── test_helpers.sh
 │   ├── test_discovery.sh
