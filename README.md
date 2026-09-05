@@ -55,6 +55,8 @@ to vendor it. Each project only commits its own `.wt.toml` and any hook scripts.
 
 ```bash
 cd <project>            # main worktree
+wt init                 # generate a default .wt.toml (main_branch auto-detected)
+git add .wt.toml && git commit
 wt add a                # create workspace slot "a" → ../worktrees/<name>-a
 cd ../worktrees/<name>-a
 wt status               # inspect the workspace
@@ -77,6 +79,7 @@ wt remove a             # remove a slot (branch retained)
 | `wt list` | Show all worktrees (main + linked) with branch and clean/dirty state. |
 | `wt status` | Show current workspace context and commits ahead of main. |
 | `wt current` | Machine-friendly, line-oriented current context. |
+| `wt init` | Generate a default `.wt.toml` (in the main worktree; `--force` to overwrite). |
 | `wt config get <key>` | Read a `.wt.toml` value (e.g. `main_branch`, `worktree.base`, `merge.remote`). |
 | `wt config set <key> <value>` | Write a `.wt.toml` value (booleans and integers preserve their TOML type). |
 | `wt doctor` | Diagnose prerequisites and repository state. |
@@ -85,8 +88,13 @@ wt remove a             # remove a slot (branch retained)
 ## Configuration (`.wt.toml`)
 
 `.wt.toml` is read from the **primary/main worktree** and is shared across all
-linked worktrees. Commit it to Githol; it must not contain machine-specific
+linked worktrees. Commit it to Git; it must not contain machine-specific
 absolute paths.
+
+> **Bootstrap:** run `wt init` in the main worktree to generate a commented
+> default `.wt.toml`. It auto-detects `main_branch` from the worktree's current
+> branch, refuses to overwrite an existing file (use `--force`), and works even
+> before `yq` is installed.
 
 ```toml
 main_branch = "develop"                 # branch owned by the primary worktree

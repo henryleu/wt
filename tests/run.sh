@@ -19,6 +19,7 @@ FILES=(
     test_switch.sh
     test_merge.sh
     test_remove.sh
+    test_init.sh
 )
 
 # Pre-flight: the implementation must exist and be an executable bash script.

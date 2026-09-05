@@ -112,8 +112,21 @@ cd /path/to/myproject     # your main checkout (on the main branch)
 ```
 
 `wt` expects the main worktree to be on the branch you designate as `main_branch`
-(default `develop`; `main` is just as common). Then create `.wt.toml` — either by
-hand or via `wt config set`:
+(default `develop`; `main` is just as common).
+
+**Bootstrap (recommended):** run `wt init` to generate a commented default
+`.wt.toml` in the main worktree. It auto-detects `main_branch` from the worktree's
+current branch, refuses to overwrite an existing file (use `--force`), and works
+even before `yq` is installed. Then commit it:
+
+```bash
+wt init
+cat .wt.toml        # review, adjust if needed
+wt config set ...   # tweak individual values if you prefer
+git add .wt.toml && git commit -m "add wt config"
+```
+
+Alternatively, create `.wt.toml` by hand or via `wt config set`:
 
 ```toml
 # .wt.toml
@@ -248,6 +261,7 @@ sure they are merged.
 | `wt list` | List all worktrees: role, slot, branch, clean/dirty. |
 | `wt status` | Show this workspace's context and how many commits it is ahead of main. |
 | `wt current` | Machine-friendly, line-oriented current context. |
+| `wt init` | Generate a default `.wt.toml` in the main worktree (`--force` overwrites). |
 | `wt config get <key>` | Read a `.wt.toml` value. |
 | `wt config set <key> <value>` | Write a `.wt.toml` value (types preserved). |
 | `wt doctor` | Verify prerequisites and repository state. |
@@ -795,8 +809,10 @@ SETUP
 
 EVERY PROJECT ONCE
   cd <main-worktree>
+  wt init                 # generate .wt.toml (main_branch auto-detected)
+  git add .wt.toml && git commit
+  wt doctor
   wt add agent-a          # + agent-b, agent-c, ...
-  # commit .wt.toml
 
 RUN AN AGENT
   cd ../worktrees/<project>-agent-a
