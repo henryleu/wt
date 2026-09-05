@@ -1,0 +1,37 @@
+# Example .wt.toml for a project using `wt`.
+#
+# This file belongs to the project and is committed to Git. It is read from
+# the PRIMARY/main worktree and therefore is shared by all linked worktrees.
+# Do not put machine-specific absolute paths here.
+#
+# To create one in your project, copy this file to <main-worktree>/.wt.toml
+# and adjust. You can also generate values with `wt config set`.
+
+main_branch = "develop"
+
+[worktree]
+# Directory containing agent worktrees. Relative paths resolve against the
+# main worktree root.
+base = "../worktrees"
+# Target directory name; placeholders: ${project_name}, ${slot}
+pattern = "${project_name}-${slot}"
+
+[branch]
+# Default branch created by `wt add <slot>` when no branch is given.
+# Placeholders: ${slot}, ${project_name}
+pattern = "workspace/${slot}"
+
+[merge]
+# Merge strategy: no-ff or ff-only
+strategy = "no-ff"
+# Remote used for fetch/push on `wt merge`
+remote = "origin"
+# Whether `wt merge` pushes the main branch after a successful merge
+push = true
+
+[hooks]
+# Optional script run after a worktree is created. Path is relative to the
+# main project root. The script runs with the new worktree as its working dir
+# and receives WT_MAIN_WORKTREE, WT_WORKTREE, WT_SLOT, WT_BRANCH,
+# WT_PROJECT_NAME environment variables.
+# post_setup = "scripts/setup-worktree.sh"
