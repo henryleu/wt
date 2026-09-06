@@ -86,4 +86,29 @@ begintest "D7 already up to date"
 count="$(git -C "$PROJECT" rev-list --count develop --not origin/develop 2>/dev/null || echo 0)"
 assert "no spurious commits on already-merged re-merge" test "$count" -ge 0
 
+# D8: no-ff merge message embeds the merged branch's commit subjects
+# (merge.log default), so git log / agents see what the merge folded in.
+begintest "D8 merge message embeds source commit subjects"
+# fresh slot + branch, two commits with distinctive subjects
+(cd "$PROJECT" && "$WT" add logcheck >/dev/null 2>&1)
+LW="$WORKTREES/project-logcheck"
+(cd "$LW" && echo m1 > m1.txt && git add m1.txt && git commit -qm "feat(x): first logcheck task")
+(cd "$LW" && echo m2 > m2.txt && git add m2.txt && git commit -qm "docs(y): second logcheck note")
+(cd "$LW" && "$WT" merge >/dev/null 2>&1) || fail "merge succeeded"
+msg="$(git -C "$PROJECT" log -1 --format=%B develop)"
+case "$msg" in
+    *"feat(x): first logcheck task"*) ok "merge message embeds source commit subject 1" ;;
+    *) fail "merge message embeds source commit subject 1 (got: $msg)" ;;
+esac
+case "$msg" in
+    *"docs(y): second logcheck note"*) ok "merge message embeds source commit subject 2" ;;
+    *) fail "merge message embeds source commit subject 2 (got: $msg)" ;;
+esac
+# and it is a real merge commit (no-ff), not a fast-forward
+if git -C "$PROJECT" rev-parse develop^2 >/dev/null 2>&1; then
+    ok "merge commit has two parents (no-ff preserved)"
+else
+    fail "merge commit has two parents"
+fi
+
 finish

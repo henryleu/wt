@@ -536,6 +536,9 @@ Default:
 ```toml
 [merge]
 strategy = "no-ff"
+# Optional: how many merged-branch commit subjects to embed in the merge
+# message (git merge --log=N). 0/false disables; true uses git's default.
+log = 20
 ```
 
 The strategy must be configurable, but v1 should support only clearly defined safe values, for example:
@@ -548,8 +551,16 @@ Do not expose arbitrary raw merge flags through configuration in v1.
 For `no-ff`:
 
 ```bash
-git -C "$main_worktree" merge --no-ff "$current_branch"
+git -C "$main_worktree" merge --no-ff --log="${merge_log:-20}" "$current_branch"
 ```
+
+The `--log` flag appends the merged branch's commit subjects to the merge
+commit message. This is the key mechanism for keeping agent work legible:
+without it, `git log --first-parent` shows only a wall of generic
+"Merge <slot> into <main>" messages and the per-task details (what each agent
+commit actually did) are hidden behind the merge's second parent. Embedding
+them means the merge commit itself is self-describing — for both humans and
+agents analyzing history later.
 
 For `ff-only`:
 

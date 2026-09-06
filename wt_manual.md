@@ -319,6 +319,22 @@ push origin develop                (only when push=true)
 
 Your shell stays in the agent slot the whole time.
 
+With `no-ff` and the default `merge.log = 20`, the merge commit embeds the
+merged branch's commit subjects (git `--log`), so the merge message reads like:
+
+```text
+Merge workspace/a into develop
+
+* workspace/a:
+  feat(chat): add stream-follow controller
+  docs(web): tidy code snippets
+  fix(gateway): null-guard model routing
+```
+
+That keeps the main-branch history self-describing: `git log --first-parent`
+shows what each merge actually folded in, so you (or an agent reviewing
+the repo later) can see what was done without walking into merge parents.
+
 ### `wt switch <branch>`
 
 - Existing branch → `git switch <branch>`.
@@ -404,6 +420,7 @@ pattern = "workspace/${slot}"           # default branch template for `wt add`
 strategy = "no-ff"                      # no-ff | ff-only
 remote = "origin"                       # remote for fetch/push
 push = true                             # push main branch after a successful merge
+log = 20                                # commit subjects embedded in merge message (0/off disables)
 
 [hooks]
 post_setup = "scripts/setup-worktree.sh" # optional script run after a worktree is created
@@ -420,6 +437,7 @@ Defaults if a key is omitted:
 | `merge.strategy` | `no-ff` |
 | `merge.remote` | `origin` |
 | `merge.push` | `true` |
+| `merge.log` | `20` |
 | `hooks.post_setup` | absent |
 
 Placeholders (v1): **`${project_name}`** and **`${slot}`** only, in

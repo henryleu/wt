@@ -109,6 +109,7 @@ pattern = "workspace/${slot}"           # default branch template
 strategy = "no-ff"                      # no-ff | ff-only
 remote = "origin"
 push = true
+log = 20                                # merged-branch commit subjects embedded in the merge message (0/off disables)
 
 [hooks]
 post_setup = "scripts/setup-worktree.sh"  # optional; runs in the new worktree
@@ -116,7 +117,8 @@ post_setup = "scripts/setup-worktree.sh"  # optional; runs in the new worktree
 
 Defaults: `main_branch=develop`, `worktree.base=../worktrees`,
 `worktree.pattern=${project_name}-${slot}`, `branch.pattern=workspace/${slot}`,
-`merge.strategy=no-ff`, `merge.remote=origin`, `merge.push=true`.
+`merge.strategy=no-ff`, `merge.remote=origin`, `merge.push=true`,
+`merge.log=20`.
 
 Supported placeholders in patterns: `${project_name}`, `${slot}`. Unknown
 placeholders are an error.

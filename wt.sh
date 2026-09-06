@@ -177,11 +177,14 @@ cfg_branch_pat()    { cfg_get branch.pattern '"workspace/${slot}"'; }
 cfg_merge_strategy(){ cfg_get merge.strategy '"no-ff"'; }
 cfg_merge_remote()  { cfg_get merge.remote '"origin"'; }
 cfg_merge_push()    { cfg_get merge.push 'true'; }
+# Number of merged-branch commit subjects to embed in the no-ff merge message
+# (git merge --log=N). 0/false disables the changelog; true uses git's default.
+cfg_merge_log()     { cfg_get merge.log '"20"'; }
 cfg_hook_post()     { cfg_get hooks.post_setup '""'; }
 
 # validate_config: reject invalid/unsafe configuration early.
 validate_config() {
-    local file mb strategy remote push
+    local file mb strategy remote push log
     file="$(config_file)"
     if [ -f "$file" ] && ! yq '.' "$file" >/dev/null 2>&1; then
         die "configuration error: $file is not valid TOML (fix syntax errors first)"
@@ -201,6 +204,12 @@ validate_config() {
         remote="$(cfg_merge_remote)"
         [ -n "$remote" ] || die "configuration error: merge.push is true but merge.remote is empty"
     fi
+
+    log="$(cfg_merge_log)"
+    case "$log" in
+        ''|true|false|[0-9]*) : ;; # non-negative integer or boolean
+        *) die "configuration error: merge.log '$log' must be a non-negative integer or a boolean" ;;
+    esac
 }
 
 # ----------------------------------------------------------------------------
@@ -364,6 +373,7 @@ CONFIG (.wt.toml, committed to Git, read from the main worktree)
   merge.strategy         no-ff | ff-only
   merge.remote           remote for fetch/push (default origin)
   merge.push             whether wt merge pushes after success (default true)
+  merge.log              commits from the merged branch embedded in the merge message (default 20; 0/off disables)
   hooks.post_setup       optional script run after a worktree is created
 
 ENVIRONMENT
@@ -724,10 +734,11 @@ cmd_merge() {
         die "a merge is already in progress in the main worktree; resolve or abort it first"
     fi
 
-    local strategy remote push
+    local strategy remote push log
     strategy="$(cfg_merge_strategy)"
     remote="$(cfg_merge_remote)"
     push="$(cfg_merge_push)"
+    log="$(cfg_merge_log)"
 
     # 6. remote checks when push is enabled
     local remote_present=false
@@ -770,8 +781,22 @@ cmd_merge() {
     # 10. merge
     case "$strategy" in
         no-ff)
-            git -C "$main_wt" merge --no-ff -m "Merge $source_branch into $main_branch" "$source_branch" >/dev/null 2>&1 \
-                || merge_failed "$main_wt" "$source_branch" "$main_branch"
+            # merge.log embeds the source branch's recent commit subjects into
+            # the merge message, so git log / agents can see what this merge
+            # actually folded in without walking the second parent.
+            local logflag=""
+            case "$log" in
+                ''|0|false) logflag="" ;;       # changelog disabled
+                true)       logflag="--log" ;;  # git's default count
+                *)          logflag="--log=$log" ;;
+            esac
+            if [ -n "$logflag" ]; then
+                git -C "$main_wt" merge --no-ff "$logflag" -m "Merge $source_branch into $main_branch" "$source_branch" >/dev/null 2>&1 \
+                    || merge_failed "$main_wt" "$source_branch" "$main_branch"
+            else
+                git -C "$main_wt" merge --no-ff -m "Merge $source_branch into $main_branch" "$source_branch" >/dev/null 2>&1 \
+                    || merge_failed "$main_wt" "$source_branch" "$main_branch"
+            fi
             ;;
         ff-only)
             git -C "$main_wt" merge --ff-only "$source_branch" >/dev/null 2>&1 \

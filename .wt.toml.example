@@ -28,6 +28,10 @@ strategy = "no-ff"
 remote = "origin"
 # Whether `wt merge` pushes the main branch after a successful merge
 push = true
+# How many commit subjects from the merged branch are embedded in the no-ff
+# merge message (git merge --log=N). Keeps the merge commit self-describing
+# so `git log` / agents can see what the merge folded in. 0 or false disables.
+log = 20
 
 [hooks]
 # Optional script run after a worktree is created. Path is relative to the
