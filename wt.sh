@@ -146,28 +146,38 @@ config_present() {
     [ -f "$(config_file)" ]
 }
 
+# cfg_default_to_plain YQ_DEFAULT_LITERAL
+#   Renders a yq default literal (e.g. '"develop"', 'true', '20') as the plain
+#   value a caller expects ('develop', 'true', '20').
+cfg_default_to_plain() {
+    local def="$1"
+    case "$def" in
+        '') printf '' ;;
+        true|false|[0-9]*) printf '%s' "$def" ;;
+        \"*\") local d="${def#\"}"; printf '%s' "${d%\"}" ;;
+        *) printf '%s' "$def" ;;
+    esac
+}
+
 # cfg_get KEY YQ_DEFAULT_LITERAL
-#   Reads a dotted key from .wt.toml. Missing/empty values fall back to the
+#   Reads a dotted key from .wt.toml. Missing/null values fall back to the
 #   provided yq literal (e.g. '"develop"', 'true'). Prints the raw value.
+#
+#   IMPORTANT: we read the key raw and apply the default in shell. yq's `//`
+#   alternative operator treats false/0 as "null-ish", so `merge.push = false`
+#   or `merge.log = 0` would otherwise be silently replaced by the default.
 cfg_get() {
-    local key="$1" def="$2" d
+    local key="$1" def="$2" val
     if ! config_present; then
-        # No config file: emit the default as a plain value. String defaults
-        # arrive as yq literals (e.g. '"develop"'); strip the surrounding
-        # quotes so callers see 'develop', not '"develop"'.
-        case "$def" in
-            '') printf '' ;;
-            'true') printf 'true' ;;
-            'false') printf 'false' ;;
-            \"*\")
-                d="${def#\"}"
-                printf '%s' "${d%\"}"
-                ;;
-            *) printf '%s' "$def" ;;
-        esac
+        cfg_default_to_plain "$def"
         return
     fi
-    yq -r ".$key // $def" "$(config_file)" 2>/dev/null || true
+    val="$(yq -r ".$key" "$(config_file)" 2>/dev/null)" || true
+    if [ -z "$val" ] || [ "$val" = "null" ]; then
+        cfg_default_to_plain "$def"
+    else
+        printf '%s' "$val"
+    fi
 }
 
 cfg_main_branch()   { cfg_get main_branch '"develop"'; }
@@ -337,6 +347,41 @@ slot_of_path() {
 # Commands
 # ----------------------------------------------------------------------------
 
+# merge_branch_now: perform the configured merge of BRANCH into the main
+# branch, operating on the main worktree at MAIN_WT. Shared by `wt merge`
+# (one branch) and `wt sync` (all slot branches). This MUTATES refs and the
+# main worktree; callers must hold the project lock and have already fetched
+# / fast-forwarded main. On conflict it calls merge_failed (which aborts the
+# merge state and exits); it only returns on success.
+merge_branch_now() {
+    local main_wt="$1" branch="$2" main_branch="$3" strategy="$4" log="$5"
+    case "$strategy" in
+        no-ff)
+            # merge.log embeds the source branch's recent commit subjects into
+            # the merge message, so git log / agents can see what this merge
+            # actually folded in without walking the second parent.
+            local logflag=""
+            case "$log" in
+                ''|0|false) logflag="" ;;       # changelog disabled
+                true)       logflag="--log" ;;  # git's default count
+                *)          logflag="--log=$log" ;;
+            esac
+            if [ -n "$logflag" ]; then
+                git -C "$main_wt" merge --no-ff "$logflag" -m "Merge $branch into $main_branch" "$branch" >/dev/null 2>&1 \
+                    || merge_failed "$main_wt" "$branch" "$main_branch"
+            else
+                git -C "$main_wt" merge --no-ff -m "Merge $branch into $main_branch" "$branch" >/dev/null 2>&1 \
+                    || merge_failed "$main_wt" "$branch" "$main_branch"
+            fi
+            ;;
+        ff-only)
+            git -C "$main_wt" merge --ff-only "$branch" >/dev/null 2>&1 \
+                || merge_failed "$main_wt" "$branch" "$main_branch"
+            ;;
+        *) die "configuration error: unsupported merge.strategy '$strategy'" ;;
+    esac
+}
+
 cmd_help() {
     cat <<'EOF'
 wt — Worktree Tool
@@ -348,6 +393,7 @@ USAGE
   wt remove <slot>           remove a worktree slot (via git, safe by default)
   wt switch <branch>         switch this worktree's branch (new branches from main)
   wt merge                   merge current branch into the main worktree (no cd)
+  wt sync                    merge every slot branch into main, then align all worktrees
   wt list                    list all worktrees
   wt status                  show current workspace status
   wt current                 machine-friendly current context
@@ -372,7 +418,7 @@ CONFIG (.wt.toml, committed to Git, read from the main worktree)
   branch.pattern         default branch template: ${slot}, ${project_name}
   merge.strategy         no-ff | ff-only
   merge.remote           remote for fetch/push (default origin)
-  merge.push             whether wt merge pushes after success (default true)
+  merge.push             whether wt merge/wt sync pushes after success (default true)
   merge.log              commits from the merged branch embedded in the merge message (default 20; 0/off disables)
   hooks.post_setup       optional script run after a worktree is created
 
@@ -779,31 +825,7 @@ cmd_merge() {
     fi
 
     # 10. merge
-    case "$strategy" in
-        no-ff)
-            # merge.log embeds the source branch's recent commit subjects into
-            # the merge message, so git log / agents can see what this merge
-            # actually folded in without walking the second parent.
-            local logflag=""
-            case "$log" in
-                ''|0|false) logflag="" ;;       # changelog disabled
-                true)       logflag="--log" ;;  # git's default count
-                *)          logflag="--log=$log" ;;
-            esac
-            if [ -n "$logflag" ]; then
-                git -C "$main_wt" merge --no-ff "$logflag" -m "Merge $source_branch into $main_branch" "$source_branch" >/dev/null 2>&1 \
-                    || merge_failed "$main_wt" "$source_branch" "$main_branch"
-            else
-                git -C "$main_wt" merge --no-ff -m "Merge $source_branch into $main_branch" "$source_branch" >/dev/null 2>&1 \
-                    || merge_failed "$main_wt" "$source_branch" "$main_branch"
-            fi
-            ;;
-        ff-only)
-            git -C "$main_wt" merge --ff-only "$source_branch" >/dev/null 2>&1 \
-                || merge_failed "$main_wt" "$source_branch" "$main_branch"
-            ;;
-        *) die "configuration error: unsupported merge.strategy '$strategy'" ;;
-    esac
+    merge_branch_now "$main_wt" "$source_branch" "$main_branch" "$strategy" "$log"
 
     info "merged $source_branch into $main_branch (in $main_wt)"
 
@@ -845,6 +867,214 @@ push_failed() {
     printf '%s: push failed: %s/%s could not be updated\n' "$WT_PROG" "$remote" "$mb" >&2
     printf '%s: local %s contains the merge; no reset was performed\n' "$WT_PROG" "$mb" >&2
     exit 1
+}
+
+# Temporary worktree used by `wt sync`'s read-only dry run, plus the scratch
+# tables listing slots/branches. The dry worktree lives OUTSIDE the project's
+# worktree base so it is never mistaken for a real slot. All are removed (and
+# the lock released) by the sync exit trap.
+WT_SYNC_DRY_WT=""
+WT_SYNC_TMP_FILES=""
+
+sync_cleanup() {
+    if [ -n "${WT_SYNC_DRY_WT:-}" ] && [ -d "$WT_SYNC_DRY_WT" ]; then
+        git -C "$WT_MAIN" worktree remove --force "$WT_SYNC_DRY_WT" >/dev/null 2>&1 || true
+        rmdir "$WT_SYNC_DRY_WT" >/dev/null 2>&1 || true
+        WT_SYNC_DRY_WT=""
+    fi
+    local f
+    for f in ${WT_SYNC_TMP_FILES}; do
+        [ -e "$f" ] && rm -f "$f"
+    done
+    WT_SYNC_TMP_FILES=""
+    project_lock_release
+}
+
+cmd_sync() {
+    require_project
+    validate_config
+
+    local main_wt main_branch strategy remote push log
+    main_wt="$WT_MAIN"
+    main_branch="$(cfg_main_branch)"
+    strategy="$(cfg_merge_strategy)"
+    remote="$(cfg_merge_remote)"
+    push="$(cfg_merge_push)"
+    log="$(cfg_merge_log)"
+
+    # ---- preconditions (read-only; runnable from any worktree) ----
+    local main_here
+    main_here="$(branch_of_worktree "$main_wt")"
+    [ -n "$main_here" ] || die "main worktree is detached at $main_wt; sync requires it on $main_branch"
+    [ "$main_here" = "$main_branch" ] || \
+        die "main worktree is on '$main_here'; it must be on '$main_branch' before wt sync"
+
+    is_clean "$main_wt" || \
+        die "main worktree at $main_wt has uncommitted changes; commit or clean it before wt sync"
+
+    if git -C "$main_wt" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+        die "a merge is already in progress in the main worktree; resolve or abort it first"
+    fi
+
+    git -C "$main_wt" rev-parse -q --verify "refs/heads/$main_branch" >/dev/null 2>&1 || \
+        die "configured main branch '$main_branch' not found"
+
+    local remote_present=false
+    if git -C "$main_wt" remote get-url "$remote" >/dev/null 2>&1; then
+        remote_present=true
+    elif [ "$push" = "true" ]; then
+        die "merge.push is true but remote '$remote' is not configured"
+    fi
+
+    # Collect linked (agent) worktrees: every one must be clean and on a
+    # branch. Build a newline-terminated table via a temp file -- appending via
+    # $(...) would strip the trailing newlines and weld rows together.
+    local root br slots_tsv
+    slots_tsv="$(mktemp "${TMPDIR:-/tmp}/wt-sync-slots-XXXXXX")"
+    WT_SYNC_TMP_FILES="$slots_tsv"
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        [ "$root" = "$main_wt" ] && continue
+        br="$(branch_of_worktree "$root")"
+        if [ -z "$br" ]; then
+            die "worktree at $root is detached; check it out on a branch before wt sync"
+        fi
+        if ! is_clean "$root"; then
+            die "worktree at $root (branch $br) has uncommitted changes; commit or clean it before wt sync"
+        fi
+        printf '%s\t%s
+' "$br" "$root" >> "$slots_tsv"
+    done < <(worktree_roots)
+
+    # ---- lock for the whole operation ----
+    project_lock_acquire sync
+    trap sync_cleanup EXIT
+
+    # ---- integrate remote/main before anything else (fail-safe, no rewrite) ----
+    if [ "$remote_present" = "true" ]; then
+        info "fetching $remote/$main_branch ..."
+        if ! git -C "$main_wt" fetch "$remote" "$main_branch" >/dev/null 2>&1; then
+            die "fetch from $remote/$main_branch failed; aborting before sync (nothing changed)"
+        fi
+        if ! git -C "$main_wt" merge --ff-only "$remote/$main_branch" >/dev/null 2>&1; then
+            die "local $main_branch is ahead of or diverged from $remote/$main_branch; refusing to overwrite history (resolve manually)"
+        fi
+    fi
+
+    # Order branches deterministically and skip ones already merged into main.
+    local n_to_merge=0 n_slots=0
+    local b r
+    # Newline-terminated list of branches pending a real merge (sorted).
+    local to_merge_file
+    to_merge_file="$(mktemp "${TMPDIR:-/tmp}/wt-sync-merge-XXXXXX")"
+    # Sort the table by branch for deterministic merge ordering.
+    local sorted_tsv
+    sorted_tsv="$(mktemp "${TMPDIR:-/tmp}/wt-sync-sorted-XXXXXX")"
+    WT_SYNC_TMP_FILES="$slots_tsv $to_merge_file $sorted_tsv"
+    sort "$slots_tsv" > "$sorted_tsv"
+    while IFS=$'\t' read -r b r; do
+        [ -n "$b" ] || continue
+        n_slots=$((n_slots+1))
+        if git -C "$main_wt" branch --merged "$main_branch" --format='%(refname:short)' --list "$b" 2>/dev/null \
+            | grep -Fixq "$b"; then
+            info "skip (already merged): $b  ($r)"
+            continue
+        fi
+        printf '%s\n' "$b" >> "$to_merge_file"
+        n_to_merge=$((n_to_merge+1))
+    done < "$sorted_tsv"
+
+    if [ "$n_slots" -eq 0 ]; then
+        info "no linked worktrees; main worktree is up to date on $main_branch"
+        if [ "$push" = "true" ] && [ "$remote_present" = "true" ]; then
+            git -C "$main_wt" push "$remote" "$main_branch" >/dev/null 2>&1 \
+                || push_failed "$main_branch" "$remote"
+        fi
+        info "sync complete (main worktree only)"
+        return 0
+    fi
+
+    if [ "$n_to_merge" -eq 0 ]; then
+        info "all slot branches are already merged into $main_branch"
+    else
+        # ---- phase 1: read-only dry run in a throwaway detached worktree ----
+        # This replays every pending merge into a copy of main WITHOUT touching
+        # any real branch or the main worktree, so a conflict aborts sync
+        # before anything is mutated (all-or-nothing).
+        WT_SYNC_DRY_WT="$(mktemp -d "${TMPDIR:-/tmp}/wt-sync-dry-XXXXXX")"
+        git -C "$main_wt" worktree add --detach "$WT_SYNC_DRY_WT" "$main_branch" >/dev/null 2>&1 \
+            || die "internal: could not create temporary dry-run worktree"
+
+        info "pre-check: simulating merge of $n_to_merge branch(es) into $main_branch ..."
+        local i=1
+        while [ "$i" -le "$n_to_merge" ]; do
+            b="$(sed -n "${i}p" "$to_merge_file")"
+            info "  pre-check: $b"
+            case "$strategy" in
+                no-ff)
+                    if ! git -C "$WT_SYNC_DRY_WT" merge --no-ff --no-commit "$b" >/dev/null 2>&1; then
+                        # Abort the dry merge (for a clear message), then bail.
+                        git -C "$WT_SYNC_DRY_WT" merge --abort >/dev/null 2>&1 || true
+                        die "sync aborted: merging $b into $main_branch conflicts. No worktree or branch was changed. Resolve the conflict in that slot, then re-run wt sync."
+                    fi
+                    # Commit the clean dry merge so later branches merge against
+                    # the cumulative result (this commit is discarded with the
+                    # temporary worktree). Provide an identity explicitly so a
+                    # repo without user.name/user.email still dry-runs.
+                    git -C "$WT_SYNC_DRY_WT" \
+                        -c user.name="wt-sync" -c user.email="wt-sync@localhost" \
+                        commit --no-verify -qm "dry-merge $b" >/dev/null 2>&1 || \
+                        die "internal: dry-run commit failed while simulating merge of $b"
+                    ;;
+                ff-only)
+                    if ! git -C "$WT_SYNC_DRY_WT" merge --ff-only "$b" >/dev/null 2>&1; then
+                        die "sync aborted: $b cannot fast-forward into $main_branch (conflict or divergence). No worktree or branch was changed. Rebase/resolve manually, then re-run wt sync."
+                    fi
+                    ;;
+            esac
+            i=$((i+1))
+        done
+
+        # Dry run passed: discard the scratch worktree before real mutations.
+        git -C "$main_wt" worktree remove --force "$WT_SYNC_DRY_WT" >/dev/null 2>&1 || true
+        rmdir "$WT_SYNC_DRY_WT" >/dev/null 2>&1 || true
+        WT_SYNC_DRY_WT=""
+
+        # ---- phase 2: real merges into the main worktree ----
+        info "merging $n_to_merge branch(es) into $main_branch ..."
+        i=1
+        while [ "$i" -le "$n_to_merge" ]; do
+            b="$(sed -n "${i}p" "$to_merge_file")"
+            merge_branch_now "$main_wt" "$b" "$main_branch" "$strategy" "$log"
+            info "  merged: $b"
+            i=$((i+1))
+        done
+
+        # One push after all merges (atomic-ish and avoids repeated network ops).
+        if [ "$push" = "true" ] && [ "$remote_present" = "true" ]; then
+            git -C "$main_wt" push "$remote" "$main_branch" \
+                || push_failed "$main_branch" "$remote"
+            info "pushed $remote/$main_branch"
+        fi
+    fi
+
+    # ---- phase 3: align every linked worktree to the new main tip ----
+    # Slots stay on their own branches; fast-forwarding the branch to the main
+    # tip makes each slot's tree identical to main (a checked-out branch can
+    # never be main itself). Safe (ff-only) because each slot branch is now an
+    # ancestor of main. Update every slot (the full sorted list), not just the
+    # ones that were merged -- already-merged slots may simply be behind.
+    info "updating $n_slots worktree(s) to latest $main_branch ..."
+    while IFS=$'\t' read -r b r; do
+        [ -n "$b" ] || continue
+        if git -C "$r" merge --ff-only "$main_branch" >/dev/null 2>&1; then
+            info "  updated: $(basename "$r") ($b) -> $main_branch"
+        else
+            die "failed to fast-forward worktree at $r ($b) to $main_branch; the branch merges are already in main (inspect this slot manually)"
+        fi
+    done < "$sorted_tsv"
+
+    info "sync complete: all worktrees are at the latest $main_branch"
 }
 
 # sanitize a config key to a safe dotted path (prevents yq injection).
@@ -974,6 +1204,7 @@ main() {
         add)     cmd_add "$@" ;;
         remove)  cmd_remove "$@" ;;
         merge)   cmd_merge "$@" ;;
+        sync)    cmd_sync "$@" ;;
         switch)  cmd_switch "$@" ;;
         list)    cmd_list ;;
         status)  cmd_status ;;
@@ -996,6 +1227,7 @@ Commands:
   remove <slot>           remove a worktree slot (safe by default)
   switch <branch>         switch or create a branch (new from main)
   merge                   merge current branch into the main worktree
+  sync                    merge all slot branches into main, then align all worktrees
   list                    list all worktrees
   status                  show current workspace status
   current                 machine-friendly current context

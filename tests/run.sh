@@ -18,6 +18,7 @@ FILES=(
     test_add.sh
     test_switch.sh
     test_merge.sh
+    test_sync.sh
     test_remove.sh
     test_init.sh
 )

@@ -257,6 +257,7 @@ sure they are merged.
 | `wt add <slot> [branch]` | Create a persistent worktree slot (default branch `workspace/<slot>`; or attach/create the given branch). |
 | `wt remove <slot>` | Remove a slot via `git worktree remove`. Refuses dirty unless `--force`. Never removes the main worktree or the branch. |
 | `wt merge` | Merge the current slot's branch into the main worktree's main branch; fetch/push according to config. Never `cd`s. |
+| `wt sync` | Merge **every** slot's branch into main, push, then fast-forward all worktrees to the same commit. Runnable from any worktree (slot or main); all-or-nothing (conflicts abort before anything changes). |
 | `wt switch <branch>` | Switch this slot's branch. Creates new branches from the main branch. Refuses to switch a linked worktree to the main branch. |
 | `wt list` | List all worktrees: role, slot, branch, clean/dirty. |
 | `wt status` | Show this workspace's context and how many commits it is ahead of main. |
@@ -334,6 +335,30 @@ Merge workspace/a into develop
 That keeps the main-branch history self-describing: `git log --first-parent`
 shows what each merge actually folded in, so you (or an agent reviewing
 the repo later) can see what was done without walking into merge parents.
+
+### `wt sync`  ← bring the whole board together
+
+Runs from **any worktree** — an agent slot *or* the main worktree — and brings
+everyone to the same commit. Under one project lock it:
+
+1. Pre-flights: every worktree must be clean and on a branch (no detached
+   HEAD), and the main worktree must be on the configured main branch.
+2. Fetches and safely fast-forwards local main to the remote (same fail-safe
+   rule as `wt merge`; never rewrites history).
+3. **Dry run:** replays every pending slot-branch merge in a throwaway,
+   detached worktree (outside the project). No real branch or worktree is
+   touched. If *any* branch conflicts, sync aborts naming that branch, and the
+   repo is exactly as it was — all-or-nothing.
+4. Merges every pending branch into main (sorted by branch name, `no-ff` or
+   `ff-only` per config), then pushes once if `push=true`.
+5. Fast-forwards **each slot's own branch** to the new main tip. Slots never
+   leave their task branch (a linked worktree is never switched onto main);
+   after this they simply point at the same commit as main.
+
+The end state: the main worktree and every slot are at the identical commit.
+Slot branches that were already merged are skipped for the merge but still
+fast-forwarded if they were behind. With no linked worktrees it just confirms
+main is up to date.
 
 ### `wt switch <branch>`
 

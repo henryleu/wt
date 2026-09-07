@@ -74,6 +74,7 @@ wt remove a             # remove a slot (branch retained)
 | `wt add <slot> [branch]` | Create a persistent worktree slot. Branch defaults to `branch.pattern`; an existing or new branch may be given explicitly (`-b` new branches start from the main branch). |
 | `wt remove <slot>` | Remove a slot via `git worktree remove`. Refuses dirty worktrees unless `--force`. Never removes the main worktree or the branch. |
 | `wt merge` | Merge the current worktree's branch into the main worktree, optionally push. Requires a clean source and clean main. Aborts cleanly on conflict. |
+| `wt sync` | Batch: merge **every** slot's branch into main, push, then fast-forward every worktree (main + all slots) to the same commit. Runnable from any worktree (a slot *or* main). Dry-run checks all merges first and aborts atomically on any conflict. |
 | `wt switch <branch>` | Switch this worktree's branch; creates new branches from the configured main branch. Refuses to switch a *linked* worktree to the main branch. |
 | `wt list` | Show all worktrees (main + linked) with branch and clean/dirty state. |
 | `wt status` | Show current workspace context and commits ahead of main. |
@@ -140,6 +141,10 @@ non-zero.
 - Branches are **never** deleted automatically.
 - `wt merge` refuses a dirty source or dirty main, and aborts on conflicts
   without attempting auto-resolution.
+- `wt sync` pre-flights every merge in a throwaway worktree (no real branch or
+  worktree is touched); if any merge conflicts it aborts before changing
+  anything. Slots are aligned to main by fast-forwarding their **own** branch —
+  a linked worktree is never switched onto the main branch.
 - All repository mutations are serialized by a **project-isolated lock** under
   the shared Git directory (`<git-common-dir>/wt.lock`), so two agent worktrees
   cannot mutate the main worktree concurrently.
