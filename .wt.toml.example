@@ -33,6 +33,17 @@ push = true
 # so `git log` / agents can see what the merge folded in. 0 or false disables.
 log = 20
 
+[commit]
+# Coding agent used by `wt commit` when no message is given: pi | claude.
+# Empty = auto-detect (pi preferred, then claude).
+agent = ""
+# Model override passed to the agent (pi: provider/id, e.g. ce/deepseek-v3.2-671b;
+# claude: model name). Empty = agent default.
+model = ""
+# Whether `wt commit` pushes the current branch after a successful commit
+# (default false; only explicit --push or this setting enables pushing).
+push = false
+
 [hooks]
 # Optional script run after a worktree is created. Path is relative to the
 # main project root. The script runs with the new worktree as its working dir

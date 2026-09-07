@@ -13,6 +13,11 @@ set -euo pipefail
 readonly WT_VERSION="0.1.0"
 readonly WT_PROG="wt"
 readonly LOCK_TIMEOUT="${WT_LOCK_TIMEOUT:-60}" # seconds before failing lock wait
+readonly WT_COMMIT_TIMEOUT="${WT_COMMIT_TIMEOUT:-300}" # seconds per coding-agent call for wt commit
+# Approximate total size cap (characters) of the change context handed to the
+# coding agent, and the per-untracked-file content cap (bytes) for wt commit.
+readonly WT_COMMIT_CONTEXT_LIMIT="${WT_COMMIT_CONTEXT_LIMIT:-204800}"
+readonly WT_COMMIT_FILE_CAP="${WT_COMMIT_FILE_CAP:-65536}"
 
 # ----------------------------------------------------------------------------
 # Basic helpers
@@ -191,6 +196,9 @@ cfg_merge_push()    { cfg_get merge.push 'true'; }
 # (git merge --log=N). 0/false disables the changelog; true uses git's default.
 cfg_merge_log()     { cfg_get merge.log '"20"'; }
 cfg_hook_post()     { cfg_get hooks.post_setup '""'; }
+cfg_commit_agent()  { cfg_get commit.agent '""'; }
+cfg_commit_model()  { cfg_get commit.model '""'; }
+cfg_commit_push()   { cfg_get commit.push 'false'; }
 
 # validate_config: reject invalid/unsafe configuration early.
 validate_config() {
@@ -392,6 +400,7 @@ USAGE
   wt add <slot> [branch]     create a persistent worktree slot
   wt remove <slot>           remove a worktree slot (via git, safe by default)
   wt switch <branch>         switch this worktree's branch (new branches from main)
+  wt commit [message]        commit changes (agent-assisted, or explicit message)
   wt merge                   merge current branch into the main worktree (no cd)
   wt sync                    merge every slot branch into main, then align all worktrees
   wt list                    list all worktrees
@@ -421,6 +430,9 @@ CONFIG (.wt.toml, committed to Git, read from the main worktree)
   merge.push             whether wt merge/wt sync pushes after success (default true)
   merge.log              commits from the merged branch embedded in the merge message (default 20; 0/off disables)
   hooks.post_setup       optional script run after a worktree is created
+  commit.agent           coding agent for wt commit: pi | claude (default: auto-detect)
+  commit.model           model override for wt commit (empty = agent default)
+  commit.push            push after a successful wt commit (default false)
 
 ENVIRONMENT
   WT_LOCK_TIMEOUT        seconds to wait for the project lock (default 60)
@@ -869,6 +881,304 @@ push_failed() {
     exit 1
 }
 
+# ----------------------------------------------------------------------------
+# wt commit
+# ----------------------------------------------------------------------------
+
+# COMMIT_AGENT_PROMPT: instruction block handed to the coding agent as its
+# message. The change context (status/diffs/untracked files) is attached on
+# stdin by commit_prompt_context.
+readonly COMMIT_AGENT_PROMPT='You are driving a one-shot git commit for the repository in the current working directory.
+
+The changes to commit are described in the stdin block attached to this message (git status, diffs, and untracked files).
+
+Tasks:
+1. Load and follow the git-commit skill (Conventional Commits): type(scope): subject -- imperative mood, present tense, subject under 72 characters; add a body/footer when the change warrants it.
+2. Analyze ALL changes (tracked and untracked) and decide yourself what to stage (git add -A, or group files into logical commits).
+3. Run `git commit` with a conventional commit message.
+4. Never commit secrets (.env, credentials.json, private keys).
+
+Forbidden:
+- git push
+- --force, --amend, --rebase, reset, or any history rewrite
+- modifying git config
+- deleting branches
+- skipping hooks (--no-verify) unless a hook blocks you and you first ask
+
+When done, report:
+- the final commit message (subject and body), and
+- the output of `git log -1 --stat` for the commit you created.'
+
+# commit_prompt_context: assemble the change-context block for the agent
+# (spec 3.2.1). Prints to stdout. The whole block is capped at roughly
+# WT_COMMIT_CONTEXT_LIMIT characters; untracked file contents are included only
+# for text files up to WT_COMMIT_FILE_CAP bytes (larger/binary files are named
+# but not dumped).
+commit_prompt_context() {
+    local ctx=""
+    local budget="$WT_COMMIT_CONTEXT_LIMIT"
+
+    # Append TEXT to the caller's ctx (dynamic scope), truncating to the budget.
+    commit_ctx_add() {
+        local text="$1" room
+        if [ $(( ${#ctx} + ${#text} )) -le "$budget" ]; then
+            ctx+="$text"
+            return 0
+        fi
+        room=$((budget - ${#ctx}))
+        if [ "$room" -gt 0 ]; then
+            ctx+="${text:0:$room}"
+        fi
+        return 0
+    }
+
+    commit_ctx_add "=== git status --short ===
+$(git status --short 2>/dev/null || true)
+
+"
+    commit_ctx_add "=== git diff (unstaged, tracked) ===
+$(git diff 2>/dev/null || true)
+
+"
+    commit_ctx_add "=== git diff --staged ===
+$(git diff --cached 2>/dev/null || true)
+
+"
+    commit_ctx_add "=== untracked files ===
+"
+    local f size
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        [ -f "$f" ] || continue
+        size="$(wc -c < "$f" 2>/dev/null || echo 0)"
+        if [ "$size" -le "$WT_COMMIT_FILE_CAP" ] && ! commit_is_binary "$f"; then
+            commit_ctx_add "-- file: $f --\n$(cat "$f" 2>/dev/null || true)\n"
+        else
+            commit_ctx_add "-- file: $f -- (binary or >64KB, content omitted)\n"
+        fi
+    done < <(git ls-files --others --exclude-standard 2>/dev/null || true)
+
+    printf '%s\n' "$ctx"
+}
+
+# commit_is_binary FILE : true if FILE contains NUL bytes (treated as binary).
+commit_is_binary() {
+    local n all
+    n="$(LC_ALL=C tr -d '\000' < "$1" 2>/dev/null | wc -c)"
+    all="$(wc -c < "$1" 2>/dev/null || echo 0)"
+    [ "$n" -ne "$all" ]
+}
+
+# detect_commit_agent: prefer pi, then claude, by PATH presence. Prints the
+# agent name and returns 0, or returns 1 when neither is installed.
+detect_commit_agent() {
+    if command -v pi >/dev/null 2>&1; then printf 'pi\n'; return 0; fi
+    if command -v claude >/dev/null 2>&1; then printf 'claude\n'; return 0; fi
+    return 1
+}
+
+# commit_run_agent AGENT MODEL PROMPT
+#   Run the coding agent non-interactively with the change context (already
+#   piped to this function's stdin), enforcing WT_COMMIT_TIMEOUT. The agent's
+#   stdout/stderr pass through (its final report). Prints failure diagnostics
+#   and returns non-zero when the agent fails or times out; the working tree is
+#   left exactly as-is (no speculative rollback).
+commit_run_agent() {
+    local agent="$1" model="$2" prompt="$3" rc=0
+    local context skill
+    context="$(cat)" || return 1
+    skill="$HOME/.agents/skills/git-commit"
+
+    case "$agent" in
+        pi)
+            local -a pi_args=( -p --no-session -a )
+            [ -n "$model" ] && pi_args+=( --model "$model" )
+            if [ -d "$skill" ]; then
+                pi_args+=( --skill "$skill" )
+            else
+                warn "git-commit skill not found at $skill (the prompt still describes the workflow)"
+            fi
+            pi_args+=( "$prompt" )
+            printf '%s' "$context" | timeout "$WT_COMMIT_TIMEOUT" pi "${pi_args[@]}" || rc=$?
+            ;;
+        claude)
+            local -a cla_args=( -p --output-format text --dangerously-skip-permissions )
+            [ -n "$model" ] && cla_args+=( --model "$model" )
+            cla_args+=( "$prompt" )
+            printf '%s' "$context" | timeout "$WT_COMMIT_TIMEOUT" claude "${cla_args[@]}" || rc=$?
+            ;;
+        *) die "internal: unknown commit agent '$agent'" ;;
+    esac
+
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 124 ]; then
+            printf '%s: %s timed out after %ss; working tree left untouched (check for leftover agent processes/session locks)\n' \
+                "$WT_PROG" "$agent" "$WT_COMMIT_TIMEOUT" >&2
+        else
+            printf '%s: %s exited with status %s; working tree left untouched\n' \
+                "$WT_PROG" "$agent" "$rc" >&2
+            if [ "$agent" = "claude" ]; then
+                printf '%s: claude not logged in? run: claude /login\n' "$WT_PROG" >&2
+            fi
+        fi
+        return 1
+    fi
+    return 0
+}
+
+# commit_report: print the created commit's subject and stat summary.
+commit_report() {
+    git log -1 --oneline --stat 2>/dev/null || true
+}
+
+# commit_push: push the current branch to the configured remote after a
+# successful commit. Mirrors the merge command's push-failure style: the local
+# commit is kept and never rolled back.
+commit_push() {
+    local remote branch
+    remote="$(cfg_merge_remote)"
+    branch="$(current_branch)"
+    [ -n "$branch" ] || die "cannot push: HEAD is detached"
+    if ! git remote get-url "$remote" >/dev/null 2>&1; then
+        die "cannot push: remote '$remote' is not configured"
+    fi
+    if ! git push "$remote" "$branch"; then
+        printf '%s: commit succeeded locally\n' "$WT_PROG" >&2
+        printf '%s: push failed: %s/%s could not be updated\n' "$WT_PROG" "$remote" "$branch" >&2
+        printf '%s: local commit is kept; resolve the remote issue and push manually\n' "$WT_PROG" >&2
+        return 1
+    fi
+    info "pushed $remote/$branch"
+}
+
+cmd_commit() {
+    require_project
+    validate_config
+
+    # ---- parse args ----
+    local message="" agent="" model="" push="" staged=false dry_run=false
+    local -a args=("$@")
+    local i
+    for (( i=0; i<${#args[@]}; i++ )); do
+        case "${args[$i]}" in
+            --agent)
+                [ $((i+1)) -lt ${#args[@]} ] || usage_error "commit: --agent requires a value (pi|claude)"
+                agent="${args[$((i+1))]}"
+                unset 'args[i]' 'args[i+1]'
+                i=$((i+1))
+                ;;
+            --model)
+                [ $((i+1)) -lt ${#args[@]} ] || usage_error "commit: --model requires a value"
+                model="${args[$((i+1))]}"
+                unset 'args[i]' 'args[i+1]'
+                i=$((i+1))
+                ;;
+            --push)    push=true;   unset 'args[i]' ;;
+            --staged)  staged=true; unset 'args[i]' ;;
+            --dry-run) dry_run=true; unset 'args[i]' ;;
+            -*)        usage_error "commit: unknown option '${args[$i]}'" ;;
+        esac
+    done
+    for v in "${args[@]:-}"; do
+        [ -n "$v" ] || continue
+        [ -z "$message" ] || usage_error "commit: too many arguments"
+        message="$v"
+    done
+
+    # ---- config fallbacks (CLI flags win) ----
+    [ -n "$model" ] || model="$(cfg_commit_model)"
+    if [ "$push" != "true" ]; then push="$(cfg_commit_push)"; fi
+    if [ -z "$agent" ]; then
+        agent="$(cfg_commit_agent)"
+        case "$agent" in
+            pi|claude) : ;;
+            '') : ;;
+            *) die "configuration error: commit.agent '$agent' is unsupported (use pi or claude)" ;;
+        esac
+    else
+        case "$agent" in
+            pi|claude) : ;;
+            *) usage_error "commit: invalid --agent '$agent' (use pi or claude)" ;;
+        esac
+    fi
+
+    # --staged only applies to the explicit-message path; the agent path decides
+    # its own staging.
+    if [ "$staged" = "true" ] && [ -z "$message" ]; then
+        usage_error "commit: --staged requires an explicit message (the agent path decides staging itself)"
+    fi
+
+    # ---- nothing to commit ----
+    if [ -z "$(git status --porcelain 2>/dev/null)" ]; then
+        info "nothing to commit"
+        return 0
+    fi
+
+    # ---- explicit-message path (deterministic) ----
+    if [ -n "$message" ]; then
+        [ -n "${message//[[:space:]]/}" ] || \
+            die "commit message is empty or whitespace only"
+        if [ "$dry_run" = "true" ]; then
+            info "$message"
+            return 0
+        fi
+        if [ "$staged" = "true" ]; then
+            git commit -m "$message" \
+                || die "commit failed (see git output above; working tree untouched)"
+        else
+            git add -A || die "git add -A failed; nothing was committed"
+            git commit -m "$message" \
+                || die "commit failed (see git output above; working tree untouched)"
+        fi
+        commit_report
+        if [ "$push" = "true" ]; then commit_push || return 1; fi
+        return 0
+    fi
+
+    # ---- agent path ----
+    if [ -z "$agent" ]; then
+        local detected_agent
+        if detected_agent="$(detect_commit_agent)"; then
+            agent="$detected_agent"
+        else
+            printf '%s: no coding agent available (pi and claude not found in PATH)\n' "$WT_PROG" >&2
+            printf '%s: provide an explicit message instead: wt commit "feat: ..."\n' "$WT_PROG" >&2
+            printf '%s: or install/log in an agent (claude: run "claude /login")\n' "$WT_PROG" >&2
+            return 1
+        fi
+    fi
+    require_cmd timeout
+
+    local context head_before
+    context="$(commit_prompt_context)"
+
+    local prompt="$COMMIT_AGENT_PROMPT"
+    if [ "$dry_run" = "true" ]; then
+        prompt+="
+
+DRY RUN: this is a dry run. Do NOT stage or commit anything, and do NOT run any git command that writes. Only analyze the changes and print the conventional commit message you would create."
+    else
+        head_before="$(git rev-parse HEAD)"
+    fi
+
+    if ! printf '%s' "$context" | commit_run_agent "$agent" "$model" "$prompt"; then
+        return 1
+    fi
+
+    if [ "$dry_run" = "true" ]; then
+        return 0
+    fi
+
+    if [ "$(git rev-parse HEAD)" = "$head_before" ]; then
+        printf '%s: warning: agent produced no commit (HEAD unchanged)\n' "$WT_PROG" >&2
+        printf '%s: commit the changes manually or re-run with an explicit message\n' "$WT_PROG" >&2
+        return 1
+    fi
+
+    commit_report
+    if [ "$push" = "true" ]; then commit_push || return 1; fi
+}
+
 # Temporary worktree used by `wt sync`'s read-only dry run, plus the scratch
 # tables listing slots/branches. The dry worktree lives OUTSIDE the project's
 # worktree base so it is never mistaken for a real slot. All are removed (and
@@ -1184,6 +1494,14 @@ remote = "origin"
 # Whether `wt merge` pushes the main branch after a successful merge.
 push = true
 
+[commit]
+# Coding agent used by `wt commit` (no message): pi | claude (empty = auto-detect).
+agent = ""
+# Model override (pi: provider/id, claude: model name). Empty = agent default.
+model = ""
+# Whether `wt commit` pushes after a successful commit (default false).
+push = false
+
 [hooks]
 # Optional script run after a worktree is created (relative to the main project root).
 # post_setup = "scripts/setup-worktree.sh"
@@ -1203,6 +1521,7 @@ main() {
     case "$cmd" in
         add)     cmd_add "$@" ;;
         remove)  cmd_remove "$@" ;;
+        commit)  cmd_commit "$@" ;;
         merge)   cmd_merge "$@" ;;
         sync)    cmd_sync "$@" ;;
         switch)  cmd_switch "$@" ;;
@@ -1226,6 +1545,7 @@ Commands:
   add <slot> [branch]     create a persistent worktree slot
   remove <slot>           remove a worktree slot (safe by default)
   switch <branch>         switch or create a branch (new from main)
+  commit [msg] [flags]    commit changes (agent-assisted, or explicit message)
   merge                   merge current branch into the main worktree
   sync                    merge all slot branches into main, then align all worktrees
   list                    list all worktrees

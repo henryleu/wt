@@ -258,6 +258,7 @@ sure they are merged.
 | `wt remove <slot>` | Remove a slot via `git worktree remove`. Refuses dirty unless `--force`. Never removes the main worktree or the branch. |
 | `wt merge` | Merge the current slot's branch into the main worktree's main branch; fetch/push according to config. Never `cd`s. |
 | `wt sync` | Merge **every** slot's branch into main, push, then fast-forward all worktrees to the same commit. Runnable from any worktree (slot or main); all-or-nothing (conflicts abort before anything changes). |
+| `wt commit [message]` | Commit the current changes. With a message the script stages everything and commits directly; without one, a coding agent (pi/claude) analyzes the changes and drives the commit. |
 | `wt switch <branch>` | Switch this slot's branch. Creates new branches from the main branch. Refuses to switch a linked worktree to the main branch. |
 | `wt list` | List all worktrees: role, slot, branch, clean/dirty. |
 | `wt status` | Show this workspace's context and how many commits it is ahead of main. |
@@ -360,6 +361,46 @@ Slot branches that were already merged are skipped for the merge but still
 fast-forwarded if they were behind. With no linked worktrees it just confirms
 main is up to date.
 
+### `wt commit [message]`
+
+Make a Git commit from the current worktree (main *or* a slot) without leaving
+your terminal. Two paths:
+
+- **Explicit message (deterministic):** `wt commit "fix: typo"` runs `git add -A`
+  then `git commit -m "<message>"` itself. With `--staged` it commits only what
+  is already staged (no `git add`).
+- **Agent-assisted (no message):** `wt commit` sends the change context
+  (status, diffs, untracked files, capped at ~200 KB) to a coding agent — pi by
+  default, claude as fallback, or `--agent pi|claude`. The agent loads the
+  git-commit skill (Conventional Commits), decides how to stage (e.g.
+  `git add -A` or grouped adds), and runs `git commit` itself. `wt` verifies
+  HEAD moved; if the agent made no commit it warns and exits 1.
+
+Flags:
+
+| Flag | Meaning |
+| --- | --- |
+| `--agent pi\|claude` | Choose the agent (`commit.agent` config wins, else auto-detect pi → claude). |
+| `--model <model>` | Override the agent model (pi: `provider/id`, e.g. `ce/deepseek-v3.2-671b`; claude: model name). |
+| `--push` | Push the current branch after a successful commit (remote from `merge.remote`). |
+| `--staged` | Explicit-message path only: commit the staged content, no `git add -A`. |
+| `--dry-run` | Print the message (agent-generated or explicit) without writing anything. |
+
+Safety:
+
+- **Never pushes** unless `--push` or `commit.push = true` (default `false`).
+  `wt` itself never force-pushes, amends, rewrites history, edits git config, or
+  deletes branches — and these are forbidden to the agent in the prompt.
+- A clean workspace short-circuits with `nothing to commit` (exit 0) before any
+  agent is called.
+- Agent runs have a **300 s timeout** (`WT_COMMIT_TIMEOUT`). On failure or
+  timeout `wt commit` exits 1 and leaves the working tree untouched (no
+  speculative rollback).
+- With no message and no agent available, `wt commit` errors and suggests
+  `wt commit "feat: ..."` instead — it never fabricates a commit silently.
+- Committing is light and takes **no project lock** (git's index is atomic);
+  don't run `wt commit` in the same worktree as a concurrent `wt sync`/`wt merge`.
+
 ### `wt switch <branch>`
 
 - Existing branch → `git switch <branch>`.
@@ -447,6 +488,11 @@ remote = "origin"                       # remote for fetch/push
 push = true                             # push main branch after a successful merge
 log = 20                                # commit subjects embedded in merge message (0/off disables)
 
+[commit]
+agent = ""                              # coding agent for `wt commit`: pi | claude (empty = auto-detect)
+model = ""                              # model override passed to the agent (empty = agent default)
+push = false                            # push current branch after a successful `wt commit`
+
 [hooks]
 post_setup = "scripts/setup-worktree.sh" # optional script run after a worktree is created
 ```
@@ -463,6 +509,9 @@ Defaults if a key is omitted:
 | `merge.remote` | `origin` |
 | `merge.push` | `true` |
 | `merge.log` | `20` |
+| `commit.agent` | empty (auto-detect pi → claude) |
+| `commit.model` | empty (agent default) |
+| `commit.push` | `false` |
 | `hooks.post_setup` | absent |
 
 Placeholders (v1): **`${project_name}`** and **`${slot}`** only, in
@@ -829,6 +878,8 @@ to fix).
 | `wt merge` refuses with "main worktree ... uncommitted changes" | Clean the main worktree (untracked files count). See §7.3. |
 | `wt: cannot switch to develop` | You tried to check out the main branch in an agent slot; use a task branch. |
 | `wt: current worktree is detached` | `git switch <branch>` first. |
+| `wt: no coding agent available` | `wt commit` without a message needs pi or claude. Pass an explicit message (`wt commit "feat: ..."`) or install/log in an agent (claude: `claude /login`). |
+| `wt: warning: agent produced no commit` | The agent analyzed but didn't commit (or HEAD was already moved). Commit manually or re-run with a message. |
 | Push failed after merge | Local main is correct; remote advanced. Resolve (usually push again) — see §8.4. |
 | Stale `wt.lock` after a hard kill | Inspect `pid`/`hostname`/`started_at` inside `wt.lock/`; if the pid is gone, `rm -rf <git-common-dir>/wt.lock` and continue. |
 
@@ -863,7 +914,13 @@ RUN AN AGENT
 
 AGENT FINISHES
   wt status               # clean?
+  wt commit               # agent-assisted conventional commit
   wt merge                # → develop, push (no cd)
+
+QUICK COMMIT (no agent needed)
+  wt commit "fix: typo"              # git add -A + commit
+  wt commit "fix: typo" --staged     # staged content only
+  wt commit --dry-run                # see the message, write nothing
 
 NEXT TASK IN SAME SLOT
   wt switch workspace/<new-task>

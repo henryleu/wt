@@ -61,6 +61,8 @@ cd ../worktrees/<name>-a
 wt status               # inspect the workspace
 
 # ... code & commit normally ...
+wt commit               # agent-assisted conventional commit (pi/claude)
+wt commit "fix: typo"   # or: explicit message, script stages + commits
 
 wt merge                # merge current branch into the main worktree (no cd)
 wt switch workspace/another-task   # reuse the same slot for the next task
@@ -75,6 +77,7 @@ wt remove a             # remove a slot (branch retained)
 | `wt remove <slot>` | Remove a slot via `git worktree remove`. Refuses dirty worktrees unless `--force`. Never removes the main worktree or the branch. |
 | `wt merge` | Merge the current worktree's branch into the main worktree, optionally push. Requires a clean source and clean main. Aborts cleanly on conflict. |
 | `wt sync` | Batch: merge **every** slot's branch into main, push, then fast-forward every worktree (main + all slots) to the same commit. Runnable from any worktree (a slot *or* main). Dry-run checks all merges first and aborts atomically on any conflict. |
+| `wt commit [msg]` | Commit the current changes. With a message it stages everything and commits directly; without one, a coding agent (pi/claude) analyzes the changes and drives a Conventional Commit. `--dry-run`/`--push`/`--staged`/`--agent`/`--model` available. |
 | `wt switch <branch>` | Switch this worktree's branch; creates new branches from the configured main branch. Refuses to switch a *linked* worktree to the main branch. |
 | `wt list` | Show all worktrees (main + linked) with branch and clean/dirty state. |
 | `wt status` | Show current workspace context and commits ahead of main. |
@@ -112,6 +115,11 @@ remote = "origin"
 push = true
 log = 20                                # merged-branch commit subjects embedded in the merge message (0/off disables)
 
+[commit]
+agent = ""                             # coding agent for `wt commit`: pi | claude (empty = auto-detect)
+model = ""                             # model override (pi: provider/id; claude: model name) — empty = agent default
+push = false                            # push current branch after a successful `wt commit`
+
 [hooks]
 post_setup = "scripts/setup-worktree.sh"  # optional; runs in the new worktree
 ```
@@ -119,7 +127,8 @@ post_setup = "scripts/setup-worktree.sh"  # optional; runs in the new worktree
 Defaults: `main_branch=develop`, `worktree.base=../worktrees`,
 `worktree.pattern=${project_name}-${slot}`, `branch.pattern=workspace/${slot}`,
 `merge.strategy=no-ff`, `merge.remote=origin`, `merge.push=true`,
-`merge.log=20`.
+`merge.log=20`, `commit.agent=` (auto-detect pi → claude), `commit.model=`,
+`commit.push=false`.
 
 Supported placeholders in patterns: `${project_name}`, `${slot}`. Unknown
 placeholders are an error.
@@ -152,6 +161,8 @@ non-zero.
 ## Environment
 
 - `WT_LOCK_TIMEOUT` — seconds to wait for the project lock (default 60).
+- `WT_COMMIT_TIMEOUT` — seconds per coding-agent call for `wt commit` (default 300).
+- `WT_COMMIT_CONTEXT_LIMIT` / `WT_COMMIT_FILE_CAP` — caps for the change context handed to the agent (default 204800 / 65536).
 
 ## The current repository
 
