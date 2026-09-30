@@ -95,3 +95,36 @@ mechanism. It breaks the isolation that worktrees exist to provide:
   independent; clean up abandoned branches manually.
 - **`wt merge` never `cd`s.** Caller directory is preserved by construction
   (`git -C`); this is what lets agents merge without leaving their session.
+
+---
+
+## 3. Task mode (v2.1) caveats
+
+Task Workspace Mode (`wt task` / `wt port` / `wt proc` / `wt archive` /
+`wt assert`) is a toolkit for orchestrator-driven ephemeral worktrees. See
+`design.md` §40 for the model.
+
+- **`.wt/` must be gitignored in task worktrees.** The identity claim lives at
+  `<root>/.wt/task.json`. If `.wt/` is not ignored, `wt commit`'s `git add -A`
+  will stage the claim. `wt task register` prints a warning when
+  `git check-ignore -q .wt/task.json` fails — add `.wt/` to `.gitignore`.
+- **`project_key` drifts with the remote URL.** The port registry and archive
+  are keyed by a hash of the configured `merge.remote` URL. Changing that URL
+  (or `merge.remote`) changes the key, so the tool will look at a fresh, empty
+  registry/archive. Recovery is manual: `mv ~/.wt/ports/<old>.tsv
+  ~/.wt/ports/<new>.tsv` (same for `~/.wt/archive/<old>/`). Run `wt doctor` to
+  print the current key. A project with **no remote** falls back to a hash of
+  the Git common dir, which is not stable across re-clones.
+- **`~/.wt/` has no backup.** It is deliberately scratch-level state: the port
+  registry is a convenience (it can be rebuilt from the claims, and a lost row
+  only means a port may be reused) and `wt archive` is best-effort. Do not treat
+  either as durable data.
+- **`wt proc stop` matches by cwd only.** It never matches by process name, to
+  avoid killing an identically-named process elsewhere. It signals processes
+  whose working directory is inside the given DIR — if a process `cd`s
+  elsewhere, it will be missed by design.
+- **`wt` never creates or destroys task worktrees.** Lifecycle (create → work →
+  integrate → remove) is the orchestrator's; `wt` only records identity and
+  offers primitives. `wt remove` refuses a task worktree, and `wt sync` skips
+  task worktrees so a stale one cannot block slot synchronization.
+

@@ -26,6 +26,16 @@ The central value proposition: an agent stays inside `phi-a`, finishes its task,
 and runs `wt merge` to merge into the main worktree **without changing the
 caller's current working directory** and without leaving Pi/Claude Code.
 
+`wt` supports **two topologies**:
+
+- **Slot mode** (default, above): a fixed set of long-lived worktrees that are
+  reused across tasks.
+- **Task mode** (v2.1): one ephemeral worktree per task, created and destroyed
+  by an external orchestrator. `wt` stays a *toolkit* — it never owns the task
+  lifecycle, but exposes primitives (`wt task`, `wt port`, `wt proc`,
+  `wt archive`, `wt assert`) that any project's setup/teardown hooks can compose.
+  See [`design.md` §40](design.md) and [`wt_manual.md`](wt_manual.md).
+
 ## Requirements
 
 - Bash
@@ -78,6 +88,11 @@ wt remove a             # remove a slot (branch retained)
 | `wt merge` | Merge the current worktree's branch into the main worktree, optionally push. Requires a clean source and clean main. Aborts cleanly on conflict. |
 | `wt sync` | Batch: merge **every** slot's branch into main, push, then fast-forward every worktree (main + all slots) to the same commit. Runnable from any worktree (a slot *or* main). Dry-run checks all merges first and aborts atomically on any conflict. |
 | `wt commit [msg]` | Commit the current changes. With a message it stages everything and commits directly; without one, a coding agent (pi/claude) analyzes the changes and drives a Conventional Commit. `--dry-run`/`--push`/`--staged`/`--agent`/`--model` available. |
+| `wt task register\|read\|clear\|slug\|branch` | Task-mode identity claim in `<root>/.wt/task.json` (allocate ports, print/clear the claim, derive branch↔slug). Toolkit — the orchestrator owns task lifecycle. |
+| `wt port claim\|release\|list` | Per-project port registry (`~/.wt/ports/<key>.tsv`): allocate the lowest free port per app role, release, or list (TSV / `--json`). |
+| `wt proc stop --cwd DIR` | Signal processes whose **cwd** is inside DIR (TERM→KILL); never matches by name. Best-effort. |
+| `wt archive --slug S --path P…` | Best-effort snapshot of paths into `~/.wt/archive/<key>/<slug>/` with size/time budgets. |
+| `wt assert --mode main\|slot\|task` | Assert the current worktree's mode (exit 3 on mismatch) so hooks can guard where they run. |
 | `wt switch <branch>` | Switch this worktree's branch; creates new branches from the configured main branch. Refuses to switch a *linked* worktree to the main branch. |
 | `wt list` | Show all worktrees (main + linked) with branch and clean/dirty state. |
 | `wt status` | Show current workspace context and commits ahead of main. |
@@ -120,6 +135,17 @@ agent = ""                             # coding agent for `wt commit`: pi | clau
 model = ""                             # model override (pi: provider/id; claude: model name) — empty = agent default
 push = false                            # push current branch after a successful `wt commit`
 
+[task]                                  # v2.1 Task Workspace Mode (see design.md §40)
+branch_pattern = "${type}/${slug}"      # task branch template (must contain ${slug})
+types = ["task"]                        # allowed ${type} values (first = default)
+port_range_default = "10000-11000"      # fallback range for undeclared app roles (optional)
+archive_budget = 60                     # `wt archive` default time budget (seconds)
+archive_max_bytes = 26214400            # `wt archive` per-file size cap (bytes)
+
+[task.port_ranges]                      # role(app name) → closed "lo-hi" TCP range (open set)
+gateway = "10000-10200"
+web = "10201-10400"
+
 [hooks]
 post_setup = "scripts/setup-worktree.sh"  # optional; runs in the new worktree
 ```
@@ -128,7 +154,8 @@ Defaults: `main_branch=develop`, `worktree.base=../worktrees`,
 `worktree.pattern=${project_name}-${slot}`, `branch.pattern=workspace/${slot}`,
 `merge.strategy=no-ff`, `merge.remote=origin`, `merge.push=true`,
 `merge.log=20`, `commit.agent=` (auto-detect pi → claude), `commit.model=`,
-`commit.push=false`.
+`commit.push=false`, `task.branch_pattern=${type}/${slug}`, `task.types=[task]`,
+`task.archive_budget=60`, `task.archive_max_bytes=26214400`.
 
 Supported placeholders in patterns: `${project_name}`, `${slot}`. Unknown
 placeholders are an error.
@@ -163,6 +190,7 @@ non-zero.
 - `WT_LOCK_TIMEOUT` — seconds to wait for the project lock (default 60).
 - `WT_COMMIT_TIMEOUT` — seconds per coding-agent call for `wt commit` (default 300).
 - `WT_COMMIT_CONTEXT_LIMIT` / `WT_COMMIT_FILE_CAP` — caps for the change context handed to the agent (default 204800 / 65536).
+- `WT_STATE_DIR` — user-level state root for the task-mode port registry and archive (default `~/.wt`).
 
 ## The current repository
 

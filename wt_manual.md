@@ -31,6 +31,7 @@ manual to *use* `wt`; read `design.md` to understand *why* it works this way.
 13. [Exit codes and error style](#13-exit-codes-and-error-style)
 14. [Troubleshooting](#14-troubleshooting)
 15. [Quick reference card](#15-quick-reference-card)
+16. [Task mode (v2.1) — for orchestrators & hooks](#16-task-mode-v21--for-orchestrators--hooks)
 
 ---
 
@@ -935,6 +936,86 @@ SAFETY
   lock: <git-common-dir>/wt.lock · WT_LOCK_TIMEOUT=60
   exit codes: 0 ok · 1 operational · 2 usage
 ```
+
+---
+
+## 16. Task mode (v2.1) — for orchestrators & hooks
+
+Slot mode (§1) is for a **fixed set of long-lived** worktrees you reuse. Task
+mode is the opposite: **one ephemeral worktree per task**, created and destroyed
+by an external orchestrator (an agent fleet, a queue worker, CI, or a human
+script). `wt` does **not** own the task lifecycle — it is a toolbox of
+primitives that your setup/teardown hooks compose.
+
+See [`design.md` §40](design.md) for the full model. The essentials:
+
+- **Identity claim.** A task worktree is recognized solely by the file
+  `<root>/.wt/task.json`. `wt task register` writes it (allocating ports along
+  the way); `wt task clear` removes it. Slot worktrees and the main checkout are
+  never given a claim.
+- **Global state.** The port registry and archive live under `~/.wt/`
+  (override with `WT_STATE_DIR`), keyed per project. Commit nothing from
+  `~/.wt/`; gitignore `.wt/` inside the task worktree.
+- **stdout is data.** Command data goes to stdout; notes/warnings go to stderr,
+  so `wt ... | sed -n 's/^port.gateway=//p'` is always safe.
+
+### 16.1 Command reference
+
+| Command | Notes |
+| --- | --- |
+| `wt task register [--slug S] [--branch B] [--type T] [--port ROLE=PORT]… [--label L]` | Create or update this worktree's claim. Idempotent. Prints the claim as `KEY=VALUE` (`port.<role>=<n>` per port). |
+| `wt task read [--json]` | Print the claim. Exit 4 if missing/corrupt/`version != 1`. |
+| `wt task clear` | Remove the claim (idempotent; leaves the registry alone). |
+| `wt task slug [--branch B]` | Derive a slug from a branch name (pure; no side effects). |
+| `wt task branch <slug> [--type T]` | Expand `[task].branch_pattern` (pure). |
+| `wt port claim [--slug S] [--role NAME]…` | Allocate the lowest free port per role (default: all declared roles). Idempotent per `(slug, role)`. |
+| `wt port release [--slug S] [--role NAME]…` | Free this slug's rows (all, or the named roles). Idempotent. |
+| `wt port list [--slug S] [--json]` | Long TSV `slug<TAB>role<TAB>port<TAB>created_at`, or a JSON array. |
+| `wt proc stop --cwd DIR [--json]` | TERM→KILL every process whose **cwd** is inside DIR (never by name). Always exit 0. |
+| `wt archive --slug S --path P… [--budget SEC] [--max-bytes N]` | Best-effort snapshot into `~/.wt/archive/<key>/<slug>/`. Always exit 0. |
+| `wt assert --mode main\|slot\|task` | Classify the current worktree; exit 3 on mismatch. |
+| `wt current [--json]` | Now includes `mode=` and (task mode) `slug=` + `port.<role>=<n>`. |
+
+### 16.2 Writing a setup hook
+
+A setup hook runs **inside** the freshly created task worktree (the orchestrator
+created it and checked out the task branch). It should refuse to run in the
+wrong place, register the claim, and read out whatever the app needs:
+
+```sh
+wt assert --mode task || exit 3              # only ever run inside a task worktree
+claim="$(wt task register)"                  # idempotent: reprints an existing claim
+slug="$(printf '%s\n' "$claim" | sed -n 's/^slug=//p')"
+gateway="$(printf '%s\n' "$claim" | sed -n 's/^port.gateway=//p')"
+web="$(printf '%s\n' "$claim" | sed -n 's/^port.web=//p')"
+# …generate the project's env file / install deps (wt does not do this)…
+# need another app's port at runtime? allocate by role on demand:
+wt port claim --slug "$slug" --role oss-proxy   # → port.oss-proxy=5601
+```
+
+### 16.3 Writing a teardown hook
+
+Teardown runs before the orchestrator removes the worktree. Stop the worktree's
+own processes, release its ports, optionally archive scratch output, then clear
+the claim:
+
+```sh
+wt proc stop --cwd "$PWD"                    # only this worktree's processes
+wt port release --slug "$slug"               # free every role this slug held
+wt archive --slug "$slug" --path scratch --path logs   # best-effort, always 0
+wt task clear
+```
+
+### 16.4 Notes and gotchas
+
+- `wt sync` **skips** task worktrees, so a dirty or detached one never blocks a
+  slot sync; `wt remove` refuses a task worktree (delegate removal to the
+  orchestrator, after teardown).
+- `wt commit` works normally inside a task worktree (`wt merge`, too — it is the
+  recommended "integrate" step). Make sure `.wt/` is gitignored so the claim is
+  not committed.
+- `project_key` is derived from the remote URL; changing it moves the registry
+  and archive. `wt doctor` prints the current key.
 
 ---
 

@@ -31,6 +31,11 @@ WT_TEST_BASE="$(mktemp -d "${TMPDIR:-/tmp}/wt-test-XXXXXX")"
 # paths git reports (git resolves symlinks), keeping string comparisons valid.
 WT_TEST_BASE="$(cd -P "$WT_TEST_BASE" && pwd -P)"
 
+# Isolate the user-level wt state (~/.wt: ports, archive, locks) per test
+# process so runs never interfere with the developer's real state.
+export WT_STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wt-state-XXXXXX")"
+WT_STATE_DIR="$(cd -P "$WT_STATE_DIR" && pwd -P)"
+
 # t_make_repo: create a disposable repo for a test.
 # Usage: t_make_repo <var-for-project-dir>
 #   Creates a bare origin and a cloned project with a branch named $WT_MAIN_BRANCH
@@ -67,10 +72,28 @@ pattern = "workspace/\${slot}"
 strategy = "no-ff"
 remote = "origin"
 push = true
+
+[task]
+branch_pattern = "\${type}/\${slug}"
+types = ["task"]
+port_range_default = "18300-18399"
+
+[task.port_ranges]
+gateway = "18100-18199"
+web = "18200-18299"
 EOF
     git -C "$PROJECT" add .wt.toml
     git -C "$PROJECT" commit -qm "add wt config"
     git -C "$PROJECT" push -q
+}
+
+# t_add_task <slug> [type]: create a TASK-mode worktree (branch <type>/<slug>)
+# and print its path. The claim file is NOT created (call `wt task register`).
+t_add_task() {
+    local slug="$1" type="${2:-task}" path
+    path="$WORKTREES/project-$slug"
+    git -C "$PROJECT" worktree add -q "$path" -b "$type/$slug" "${WT_MAIN_BRANCH:-develop}" >/dev/null 2>&1
+    printf '%s\n' "$path"
 }
 
 # write_config: overwrite the project .wt.toml wholesale.
@@ -155,5 +178,6 @@ finish() {
 # cleanup trap
 t_cleanup() {
     rm -rf "$WT_TEST_BASE"
+    [ -n "${WT_STATE_DIR:-}" ] && rm -rf "$WT_STATE_DIR"
 }
 trap t_cleanup EXIT

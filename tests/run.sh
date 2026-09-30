@@ -20,6 +20,10 @@ FILES=(
     test_merge.sh
     test_commit.sh
     test_sync.sh
+    test_task.sh
+    test_port.sh
+    test_context.sh
+    test_proc_archive.sh
     test_remove.sh
     test_init.sh
 )

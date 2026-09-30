@@ -91,6 +91,21 @@ Do **not** build these into v1:
 
 The first version should remain a thin Git orchestration CLI.
 
+**v2.1 bounded relaxations (Task Workspace Mode, §40).** Two v1 non-goals are
+narrowly relaxed so `wt` can serve as an orchestration toolkit — not as an
+orchestrator:
+
+- *Agent process/session management* → only `wt proc stop` is added: it signals
+  processes whose **cwd** is inside a directory (never by name, never a
+  session/terminal manager).
+- *A persistent application state store* → `wt` owns a small **file-based**
+  runtime state layer (a per-worktree `.wt/task.json` claim and a user-level
+  `~/.wt/` directory for the port registry and archive). There is still no
+  database, no daemon, and no server.
+
+Everything else remains a non-goal, and `wt` never owns task **lifecycle**
+(create/ship/destroy) — an external orchestrator does.
+
 ---
 
 # 3. Design Principles
@@ -260,6 +275,8 @@ V1 commands:
 wt add <slot> [branch]
 wt remove <slot>
 wt merge
+wt sync
+wt commit [msg]
 wt switch <branch>
 wt list
 wt status
@@ -269,6 +286,16 @@ wt config set <key> <value>
 wt doctor
 wt help
 wt version
+```
+
+v2.1 adds the **Task Workspace Mode** toolkit (see §40):
+
+```text
+wt task register|read|clear|slug|branch
+wt port claim|release|list
+wt proc stop
+wt archive
+wt assert
 ```
 
 The following sections define exact semantics.
@@ -883,6 +910,17 @@ strategy = "no-ff"
 remote = "origin"
 push = true
 
+[task]                                  # v2.1 Task Workspace Mode (§40)
+branch_pattern = "${type}/${slug}"      # must contain ${slug}; ${type} optional
+types = ["task"]                        # allowed ${type} values (first = default)
+port_range_default = "10000-11000"      # fallback range for undeclared app roles
+archive_budget = 60                     # wt archive default time budget (seconds)
+archive_max_bytes = 26214400            # wt archive per-file size cap (bytes)
+
+[task.port_ranges]                      # role == app name -> closed "lo-hi" TCP range
+gateway = "10000-10200"                 # the role set is open and project-defined
+web = "10201-10400"
+
 [hooks]
 post_setup = "scripts/setup-worktree.sh"
 ```
@@ -980,6 +1018,44 @@ Optional script run after a new worktree is created.
 
 The path is relative to the **main project root**.
 
+## 15.2 `[task]` section (v2.1)
+
+Settings for Task Workspace Mode (§40). All keys are optional.
+
+### `task.branch_pattern`
+
+Branch name template for a task. Must contain `${slug}`; `${type}` is optional.
+When present, `${type}` must be one of `task.types`.
+
+Default:
+
+```text
+${type}/${slug}
+```
+
+### `task.types`
+
+Allowed `${type}` values for `task.branch_pattern`; the first entry is the
+default. Default: `["task"]`.
+
+### `task.port_range_default`
+
+Fallback `lo-hi` TCP range for app **roles** not listed under
+`task.port_ranges`. If omitted, an undeclared role cannot be allocated a port.
+
+### `task.port_ranges`
+
+A table mapping an app **role** name (`gateway`, `web`, `console`, `boss`,
+`oss-proxy`, …) to a closed `lo-hi` port range. The role set is **open**: any
+number of roles may be declared, and a role with no entry falls back to
+`task.port_range_default`. Role names must match `^[a-z][a-z0-9_-]*$`; ranges
+must match `^[0-9]{4,5}-[0-9]{4,5}$` with lo ≤ hi inside 1024–65535.
+
+### `task.archive_budget` / `task.archive_max_bytes`
+
+Defaults for `wt archive`: the time budget in seconds (default `60`) and the
+per-file size cap in bytes (default `26214400`, 25 MiB).
+
 ---
 
 # 16. Configuration Loading and Validation
@@ -1040,6 +1116,12 @@ merge.strategy = no-ff
 merge.remote = origin
 merge.push = true
 hooks.post_setup = absent
+task.branch_pattern = ${type}/${slug}
+task.types = [task]
+task.port_range_default = absent (undeclared roles cannot claim)
+task.port_ranges = {} (open role set)
+task.archive_budget = 60
+task.archive_max_bytes = 26214400
 ```
 
 The implementation should either provide these defaults centrally or write them to a generated config only when explicitly requested. Do not mutate `.wt.toml` merely because a default is being used.
@@ -1055,6 +1137,10 @@ Examples:
 - missing `merge.remote` when push is enabled
 - pattern without `${slot}` for default slot-derived directory naming, unless explicitly documented as allowed
 - absolute worktree paths if project portability is a design requirement
+- `task.branch_pattern` without `${slug}`; `${type}` used but `task.types` empty
+- a `task.port_ranges` key that is not a valid role name, or a duplicate
+- a port range not matching `^[0-9]{4,5}-[0-9]{4,5}$`, or with lo > hi, or outside 1024–65535
+- a non-positive-integer `task.archive_budget` / `task.archive_max_bytes`
 
 When in doubt, fail with a clear error rather than silently guessing.
 
@@ -2262,11 +2348,12 @@ Possible later features, only after the core tool is stable:
 - Explicit branch cleanup commands.
 - `wt prune` for stale Git worktree metadata.
 - `wt doctor --fix` for safe repairs.
-- structured `--json` output for agent tooling.
+- structured `--json` output for agent tooling *beyond* the v2.1 subset
+  (`wt current --json`, `wt port list --json`, `wt task read --json`).
 - shell completion.
 - configurable policies for remote synchronization.
-- richer workspace metadata.
-- agent process/session integration.
+- richer workspace metadata (v2.1 added a `mode` to `wt current`/`wt list`).
+- agent process/session integration (v2.1 added cwd-scoped `wt proc stop` only).
 - TUI.
 - eventual TypeScript/Bun rewrite if the project grows into an application rather than remaining a Git orchestration tool.
 
@@ -2300,6 +2387,114 @@ When a design choice is not explicitly specified:
 - do not silently mutate user history or files.
 
 If an implementation detail conflicts with these principles, choose the safer and more predictable behavior and document the decision in the code/README.
+
+---
+
+# 40. Task Workspace Mode (v2.1)
+
+`wt` understands two worktree topologies:
+
+| Mode | worktree | branch | lifecycle |
+| --- | --- | --- | --- |
+| **Slot mode** | fixed count, long-lived (`<project>-<slot>`) | `workspace/<slot>` (reused, switchable) | humans/agents reuse slots across tasks |
+| **Task mode** | one per task, created and removed by an orchestrator | one branch per task (`[task].branch_pattern`) | create → work → integrate → remove |
+
+Task mode is a **toolkit**, not a lifecycle: `wt` never creates or destroys
+task worktrees. It exposes composable primitives that any project's
+setup/teardown hooks (driven by an orchestrator) can call.
+
+## 40.1 Design contract
+
+- **Data on stdout, commentary on stderr.** A new `note()` writes explanatory
+  text to stderr (alongside `info()` which stays on stdout for backward
+  compatibility). Machine-readable output can be parsed without filtering noise.
+- **`wt` owns its own state** so it does not depend on the main checkout's path
+  stability (re-clone or rename must not lose state): a per-worktree claim at
+  `<root>/.wt/task.json` and user-level global state under `~/.wt/`
+  (`WT_STATE_DIR` overrides it, primarily for tests).
+
+## 40.2 State layer
+
+```text
+<task worktree>/.wt/task.json     per-worktree identity claim (runtime; gitignore it)
+<repo>/.wt.toml                   committed config (now with a [task] section)
+~/.wt/
+  ports/<project_key>.tsv         slug <TAB> role <TAB> port <TAB> created_at
+  ports/<project_key>.lock.d/     mkdir lock (mtime > 60s is stale and reclaimable)
+  archive/<project_key>/<slug>/   wt archive snapshot target
+```
+
+Slot worktrees and the main checkout stay **stateless** — no claim file is ever
+created for them.
+
+**Claim schema (v1).** `{"version":1,<?>}`; required `slug`, `branch`,
+`created_at`; optional `type`, `label`; `ports` is an arbitrary `role → port`
+object (may be `{}`). Readers reject a missing/corrupt/incompatible claim with
+exit 4; `task register` refuses to overwrite a corrupt claim (exit 1) and points
+at `wt task clear`. Writes are atomic (tmp file + same-filesystem `rename`).
+Port keys are role names (`^[a-z][a-z0-9_-]*$`); KEY=VALUE output always prefixes
+port lines with `port.` (`port.console=5401`) so consumers use one parse rule.
+
+**project_key.** Derived from the configured `merge.remote`'s URL, normalized
+(lowercase; strip scheme/userinfo; scp `host:path` → `host/path`; drop trailing
+`.git`/`/`; keep host and port), then `git hash-object --stdin` truncated to 12
+hex. With no usable remote it falls back to a hash of the Git common dir
+(documented as re-clone-unstable).
+
+## 40.3 Mode detection
+
+```text
+mode_of_path ROOT:
+  ROOT == main worktree     -> main
+  ROOT/.wt/task.json exists -> task
+  otherwise (linked)        -> slot
+```
+
+Detection is deliberately path/file-based — **the claim file is the only task
+signal**, never a path pattern; a detached HEAD does not change the
+classification.
+
+## 40.4 Commands
+
+- `wt task register [--slug S] [--branch B] [--type T] [--port ROLE=PORT]… [--label L]`
+  — derive `slug`/`type` from the branch (or take them explicitly), allocate any
+  unpinned declared roles from the registry, and write the claim. Idempotent:
+  a valid existing claim with no `--port` is reprinted; with `--port` the given
+  roles are updated in place (import mode). stdout = the claim as KEY=VALUE.
+- `wt task read [--json]` — print the claim; exit 4 when missing/corrupt/version≠1.
+- `wt task clear` — remove the claim (idempotent; never touches the registry).
+- `wt task slug [--branch B]` / `wt task branch <slug> [--type T]` — pure
+  branch↔slug helpers (no side effects).
+- `wt port claim|release|list` — the per-project port registry. `claim` picks
+  the **lowest free** port per role, skipping registered rows (any slug/role)
+  and LISTEN sockets; with no `--role` it allocates every declared role.
+  `release` frees rows (all or by role); `list` prints TSV or `--json`.
+- `wt proc stop --cwd DIR [--json]` — signal processes whose **cwd** is inside
+  DIR (never by name), TERM then KILL. Best-effort; always exit 0.
+- `wt archive --slug S --path P… [--budget SEC] [--max-bytes N]` — best-effort
+  snapshot into `~/.wt/archive/<project_key>/<slug>/`, honoring size and time
+  budgets; never fails the caller.
+- `wt assert --mode main|slot|task` — classify the current worktree; exit 3 on
+  mismatch. Callers decide their own force-bypass policy.
+
+## 40.5 Exit codes
+
+```text
+0 success · 1 operational failure (die) · 2 usage error
+3 assertion mismatch · 4 expected state missing/corrupt
+```
+
+## 40.6 Interaction with existing commands
+
+- `wt current` adds `mode=`, and (in task mode) `slug=` + `port.<role>=<n>`
+  lines; `--json` emits one object including the `ports` map.
+- `wt list` gains a `MODE` column in the WORKTREES table.
+- `wt sync` **skips** task worktrees (`skip (task worktree)`) before the
+  dirty/detached checks, so an ailing task worktree never blocks a slot sync.
+- `wt remove` refuses a task worktree (remove it via its orchestrator).
+- `wt merge` is unchanged and remains the recommended "integrate" primitive.
+- `wt doctor` also checks that the state dir is writable and prints the
+  project key / registry path.
 
 ---
 
