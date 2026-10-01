@@ -24,6 +24,8 @@ FILES=(
     test_port.sh
     test_context.sh
     test_proc_archive.sh
+    test_hooks.sh
+    test_env_check.sh
     test_remove.sh
     test_init.sh
 )

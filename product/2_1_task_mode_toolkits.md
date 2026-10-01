@@ -1,8 +1,18 @@
 # 产品升级 2.1：Task Workspace 模式工具集（Task-Mode Toolkit）
 
+> **2.2 重构更新（本仓库 `refactor-design.md`）**：本文件描述 v2.1 的 task 工具集。后续一次重构把
+> slot/task 统一为「一套 setup/teardown 生命周期 + 一套与流程无关的 toolkit」，具体差异：
+> - **改名**：`wt task register|read|clear` → **`wt claim register|read|clear`**（claim 是中性的身份声明，slot/task 都可声明）；`wt task slug|branch` 保留。
+> - **对称 hooks**：`hooks.setup`（取代 `hooks.post_setup`，保留一版兼容）+ 新增 **`hooks.teardown`**；`wt add` 跑 setup、`wt remove` 跑 teardown（在删除之前）；hook 额外收到 `WT_MODE=slot|task`、`WT_HOOK=setup|teardown`；目录已被删也能跑 teardown 并 `worktree prune`。
+> - **新增 toolkit**：`wt env materialize|show|get|copy`（声明式 env 平面，`[env]` 段，占位符仅 `${slug}`/`${port.<role>}`/`${env.<KEY>}`）；`wt check [--json]`（声明式 `[[check]]` 探针）；`wt teardown`（规范顺序 stop→archive→release→clear，恒 exit 0）。
+> - **新增 `[task]` 字段**：`required_roles`（claim 必带端口的角色，缺失即 fail）、`archive_paths`（`wt teardown`/`wt archive` 的默认快照路径）。
+> - **过程安全修复**：`wt proc stop` 现在从中性 cwd 扫描并排除整个 `wt` 进程子树，避免在 worktree 内调用（或经 `$(...)` 包裹）时误杀自身/调用者。
+>
+> 本文件中尚未同步的 v2.1 细节以 `refactor-design.md` 与 `wt_manual.md` 为准。
+
 ## 0. 已确认的决策（用户确认）
 
-- **Toolkit only**：wt 不拥有任务生命周期（不提供 `wt task create/ship` 之类动词）。任务 worktree 的创建/销毁由外部编排器（agent fleet / orchestrator）或人工驱动；wt 只提供可组合的状态与原语子命令。`task register/clear` 是**状态操作**，不是生命周期动词。
+- **Toolkit only**：wt 不拥有任务生命周期（不提供 `wt task create/ship` 之类动词）。任务 worktree 的创建/销毁由外部编排器（agent fleet / orchestrator）或人工驱动；wt 只提供可组合的状态与原语子命令。`claim register/clear` 是**状态操作**，不是生命周期动词。
 - **CLI 子命令暴露**：通用逻辑以子命令形式暴露（不做可 source 的 shell lib）。契约：**数据走 stdout，说明性输出走 stderr**（新增 `note()`，与 `info()` 并列；`info()` 保持 stdout 不变以免破坏现有消费者）。
 - **wt 拥有自己的状态目录**：worktree 内 `<root>/.wt/task.json`（任务身份 claim）；用户级全局 `~/.wt/`（端口注册表、归档快照、锁）。**不**依赖主 checkout 的路径稳定性（re-clone / 改名不影响）。项目仓库的 `.wt.toml` 仍只放**已提交的配置**，不放运行态。
 - **任务分支命名**：`[task]` 配置段支持带类型前缀的模板 `${type}/${slug}`（`task/`、`feature/`、`bugfix/` 等）。
@@ -75,7 +85,7 @@
 - `version` 必填；读取端拒绝 `version != 1`（exit 4），未来 schema 变更在此处迁移。
 - `slug` / `branch` / `created_at` 必填；`type` / `label` 可选；`ports` 必为对象（可为空 `{}`——不占端口的任务合法）。
 - **`ports` 是任意 `role → port` 映射**，键集不固定：角色名即项目里的 app 名（`gateway`、`web`、`console`、`boss`、`oss-proxy`…）。角色名规则 `^[a-z][a-z0-9_-]*$`（读写端都校验；写端拒绝非法/重复键）。KEY=VALUE 输出一律加 `port.` 前缀（`port.console=5401`），与顶层键天然无冲突，消费者用同一条 sed 规则解析。
-- **原子写**：`mkdir -p <root>/.wt` → 写 `<root>/.wt/.task.json.tmp.$$` → `mv`（同 fs rename 原子）。读取端解析失败一律按 corrupt 处理（exit 4）；`register` 遇 corrupt claim **拒绝静默覆盖**（exit 1，提示用 `wt task clear` 恢复）。
+- **原子写**：`mkdir -p <root>/.wt` → 写 `<root>/.wt/.task.json.tmp.$$` → `mv`（同 fs rename 原子）。读取端解析失败一律按 corrupt 处理（exit 4）；`register` 遇 corrupt claim **拒绝静默覆盖**（exit 1，提示用 `wt claim clear` 恢复）。
 - **gitignore 防御**：`register` 时执行 `git check-ignore -q .wt/task.json`，未忽略则 stderr 警告（否则 `wt commit` 的 `git add -A` 会把 claim 提交进去）。
 - 读取走 `yq -p=json -o=json`；输出（KEY=VALUE / JSON）用手写 `json_escape` + printf，不依赖 jq。
 
@@ -104,7 +114,7 @@ archive_max_bytes = 26214400         # 单文件大小上限（25 MiB）
 
 全局退出码契约（写入 help 与 design.md）：`0` 成功 · `1` 操作失败（`die`）· `2` 用法错误 · **`3` 断言不匹配** · **`4` 预期状态缺失/损坏**。
 
-### 5.1 `wt task register [--slug S] [--branch B] [--type T] [--port ROLE=PORT]... [--label L]`
+### 5.1 `wt claim register [--slug S] [--branch B] [--type T] [--port ROLE=PORT]... [--label L]`
 
 - 默认：`--branch` = 当前分支；`--slug` = 分支去掉最长匹配的 `branch_pattern` 字面前缀后净化；`--type` = 从分支按模板解析出的类型（模板无 `${type}` 时省略）。
 - `--port ROLE=PORT` 可重复，钉任意角色的显式端口（导入/接管模式），如 `--port gateway=5201 --port console=5401`；角色名按 §3.2 规则校验。
@@ -125,12 +135,12 @@ archive_max_bytes = 26214400         # 单文件大小上限（25 MiB）
   created_at=2026-09-30T09:00:00Z
   ```
 
-### 5.2 `wt task read [--json]`
+### 5.2 `wt claim read [--json]`
 
 - 打印 claim（KEY=VALUE 同上，端口行为 `port.<role>=<n>`；`--json` 输出 schema 对象，`ports` 为映射）。
 - exit 4 当缺失 / 解析失败 / `version != 1`（stderr 说明原因与恢复方式）。
 
-### 5.3 `wt task clear`
+### 5.3 `wt claim clear`
 
 - `rm -f <root>/.wt/task.json`（best-effort `rmdir .wt`）；缺失也 exit 0。**不**动注册表（释放端口是显式操作）。
 
@@ -193,7 +203,7 @@ setup 钩子（由任意编排器在新建 task worktree 内调用）：
 
 ```sh
 wt assert --mode task || exit 3                 # 拒绝在主 checkout / slot 内运行
-claim="$(wt task register)"                     # 幂等：已有 claim 则原样返回
+claim="$(wt claim register)"                     # 幂等：已有 claim 则原样返回
 slug="$(printf '%s\n' "$claim" | sed -n 's/^slug=//p')"
 gw="$(printf '%s\n' "$claim" | sed -n 's/^port.gateway=//p')"
 console="$(printf '%s\n' "$claim" | sed -n 's/^port.console=//p')"   # 任意角色，同一解析规则
@@ -208,7 +218,7 @@ teardown 钩子：
 wt proc stop --cwd "$PWD"                       # 只停本 worktree 的进程
 wt port release --slug "$slug"
 wt archive --slug "$slug" --path scratch --path logs   # best-effort，恒 0
-wt task clear
+wt claim clear
 ```
 
 ## 8. 测试计划
@@ -225,7 +235,7 @@ wt task clear
 |---|---|
 | A | 状态层：`WT_STATE_DIR`、`project_key`、claim 原子读写、`mode_of_path`、`note()` + `test_task.sh` 基础用例 |
 | B | 端口子系统：注册表文件/锁、`port claim/release/list` + `test_port.sh` |
-| C | `task register/read/clear/slug/branch`、`proc stop`、`archive`、`assert`、`current` 扩展 + `test_proc_archive.sh` |
+| C | `claim register/read/clear`、`task slug/branch`、`proc stop`、`archive`、`assert`、`current` 扩展 + `test_proc_archive.sh` |
 | D | `[task]` 配置 + 校验 + `init` 模板；`sync` 跳过；`remove` 拒绝；`doctor` 检查；文档更新 |
 
 ### 文档更新（本仓库）

@@ -12,7 +12,7 @@ t_make_repo
 (cd "$PROJECT" && "$WT" add s1 >/dev/null 2>&1)
 SLOT="$WORKTREES/project-s1"
 TASK="$(t_add_task ctx)"
-(cd "$TASK" && "$WT" task register >/dev/null 2>&1)
+(cd "$TASK" && "$WT" claim register >/dev/null 2>&1)
 
 # ---------------------------------------------------------------------------
 # C1: mode detection for all three modes.

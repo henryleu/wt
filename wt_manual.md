@@ -26,7 +26,7 @@ manual to *use* `wt`; read `design.md` to understand *why* it works this way.
 8. [Merging under parallel load (the critical part)](#8-merging-under-parallel-load-the-critical-part)
 9. [Conflicts and failure recovery](#9-conflicts-and-failure-recovery)
 10. [Concurrency, locking, and safety](#10-concurrency-locking-and-safety)
-11. [The `post_setup` hook and monorepos](#11-the-post_setup-hook-and-monorepos)
+11. [Lifecycle hooks: `setup`, `teardown` and monorepos](#11-lifecycle-hooks-setup-teardown-and-monorepos)
 12. [Scripting and agents](#12-scripting-and-agents)
 13. [Exit codes and error style](#13-exit-codes-and-error-style)
 14. [Troubleshooting](#14-troubleshooting)
@@ -146,7 +146,7 @@ remote = "origin"
 push = true
 
 [hooks]
-# post_setup = "scripts/setup-worktree.sh"
+# setup = "scripts/setup-worktree.sh"
 ```
 
 **Commit `.wt.toml` to Git.** It is shared by every linked worktree, so all agents
@@ -280,7 +280,7 @@ sure they are merged.
 - With an existing `[branch]`, the worktree attaches to it.
 - With a new `[branch]`, it is created **from the main branch**.
 - Requires a valid `.wt.toml` and the configured main branch to exist.
-- Runs `post_setup` hook (see §11) if configured.
+- Runs the `setup` hook (see §11) if configured.
 
 Example output:
 
@@ -457,14 +457,14 @@ main_worktree=/Users/you/code/myproject
 wt config get main_branch            # develop
 wt config get worktree.base          # ../worktrees
 wt config get merge.remote           # origin
-wt config get hooks.post_setup       # null if unset
+wt config get hooks.setup           # null if unset
 
 wt config set merge.push false       # writes push = false (a real TOML boolean)
 wt config set worktree.pattern '${project_name}-${slot}-v2'
 ```
 
 Keys are dotted TOML paths (`main_branch`, `worktree.base`, `merge.strategy`,
-`hooks.post_setup`, …). `set` preserves TOML types: `true`/`false` stay booleans,
+`hooks.setup`, …). `set` preserves TOML types: `true`/`false` stay booleans,
 integers stay integers, everything else is stored as a string.
 
 ---
@@ -495,7 +495,36 @@ model = ""                              # model override passed to the agent (em
 push = false                            # push current branch after a successful `wt commit`
 
 [hooks]
-post_setup = "scripts/setup-worktree.sh" # optional script run after a worktree is created
+setup = "scripts/setup-worktree.sh"       # optional; runs after a worktree is created
+teardown = "scripts/teardown-worktree.sh" # optional; runs before a worktree is removed
+
+[task]                                    # v2.1 task workspaces (see §16, design.md §40)
+branch_pattern = "${type}/${slug}"        # must contain ${slug}; ${type} optional
+types = ["task"]                          # allowed ${type} values (first = default)
+port_range_default = "10000-11000"        # fallback range for undeclared roles (optional)
+required_roles = ["gateway", "web"]       # every new claim must carry a port for these
+archive_paths = ["logs", "data"]          # paths snapshotted by `wt teardown`/`wt archive`
+archive_budget = 60
+archive_max_bytes = 26214400
+
+[task.port_ranges]                        # role(app name) -> "lo-hi" range (open set)
+gateway = "10000-10200"
+web = "10201-10400"
+
+[env.gateway]                             # optional env plane (`wt env`); see §16.5
+dir = "apps/gateway"
+files = [".env", ".env.development", ".env.development.local"]
+seed = "scripts/seed/gateway.env"
+seed_target = ".env.development"
+gen = ".env.development.local"
+copy_from_main = [".env.development", ".env.development.local"]
+[env.gateway.values]
+PORT = "${port.gateway}"
+
+[[check]]                                 # optional probes for `wt check`; see §16.6
+name = "api"
+url = "http://localhost:${port.gateway}/api/v1/models"
+expect = 200
 ```
 
 Defaults if a key is omitted:
@@ -513,7 +542,11 @@ Defaults if a key is omitted:
 | `commit.agent` | empty (auto-detect pi → claude) |
 | `commit.model` | empty (agent default) |
 | `commit.push` | `false` |
-| `hooks.post_setup` | absent |
+| `hooks.setup` | absent (`hooks.post_setup` is the legacy name) |
+| `hooks.teardown` | absent |
+| `task.required_roles` | `[]` |
+| `task.archive_paths` | `[]` |
+| `[env]` / `[[check]]` | absent (opt-in modules) |
 
 Placeholders (v1): **`${project_name}`** and **`${slot}`** only, in
 `worktree.pattern` and `branch.pattern`. Unknown placeholders are an **error** — `wt`
@@ -770,40 +803,51 @@ report the exact message.
 
 ---
 
-## 11. The `post_setup` hook and monorepos
+## 11. Lifecycle hooks: `setup`, `teardown` and monorepos
 
-Optional hook run right after `wt add` creates a worktree. Typical use: monorepo
-dependency prep (e.g. symlink shared `node_modules` so every agent slot sees
-prepared dependencies without a full install).
+`hooks.setup` runs right after `wt add` creates a worktree; `hooks.teardown`
+runs right before `wt remove` deletes one. Typical uses: monorepo dependency
+prep in setup, and resource cleanup (processes, ports, shared symlinks) in
+teardown. Both are optional and symmetric.
 
 ```toml
 [hooks]
-post_setup = "scripts/setup-worktree.sh"   # path relative to the main project root
+setup = "scripts/setup-worktree.sh"       # path relative to the main project root
+teardown = "scripts/teardown-worktree.sh" # optional; runs before removal
 ```
 
-The hook runs with the **new worktree as its working directory** and receives:
+The hook runs with the **worktree as its working directory** and receives:
 
 | Env var | Meaning |
 | --- | --- |
 | `WT_MAIN_WORKTREE` | main worktree root |
-| `WT_WORKTREE` | the newly created worktree root |
+| `WT_WORKTREE` | the worktree root (may be missing during a dir-gone teardown) |
 | `WT_SLOT` | the slot name |
 | `WT_BRANCH` | the branch checked out |
 | `WT_PROJECT_NAME` | project name (basename of main worktree) |
+| `WT_MODE` | `slot` or `task` — which topology triggered the hook |
+| `WT_HOOK` | `setup` or `teardown` — which phase is running |
 
-Example hook:
+Example hook (one script for both phases):
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-# Runs from the newly created worktree.
-mkdir -p node_modules
-ln -sfn "$WT_MAIN_WORKTREE/node_modules/shared-package" \
-        "$WT_WORKTREE/node_modules/shared-package"
+# Runs from the worktree being created/torn down.
+if [ "$WT_HOOK" = setup ]; then
+    mkdir -p node_modules
+    ln -sfn "$WT_MAIN_WORKTREE/node_modules/shared-package" \
+            "$WT_WORKTREE/node_modules/shared-package"
+else
+    rm -f "$WT_WORKTREE/node_modules/shared-package"
+fi
 ```
 
-**Failure policy:** if the hook fails, `wt add` exits non-zero and **leaves the
-worktree in place** for debugging — it never silently deletes it.
+**Failure policy:** a failing `setup` hook makes `wt add` exit non-zero and
+**leaves the worktree in place** for debugging — it never silently deletes it.
+A failing `teardown` hook is a warning and `wt remove` still completes (a
+missing worktree directory does not skip teardown either: ports/processes can
+still be cleaned up, after which stale Git metadata is pruned).
 
 > Caution for monorepos: sharing `node_modules` between worktrees means concurrent
 > installs/dependency changes can interfere. The hook mechanism does *not* imply
@@ -947,11 +991,16 @@ by an external orchestrator (an agent fleet, a queue worker, CI, or a human
 script). `wt` does **not** own the task lifecycle — it is a toolbox of
 primitives that your setup/teardown hooks compose.
 
-See [`design.md` §40](design.md) for the full model. The essentials:
+The unified mental model: **a `wt`-managed worktree has a `setup` phase and a
+`teardown` phase.** Whether it is a slot (long-lived) or a task (ephemeral)
+changes only *who triggers* those phases — `wt add`/`wt remove` for slots, the
+orchestrator for tasks. The hooks channel and the toolkit are shared. See
+[`design.md` §40](design.md) and [`refactor-design.md`](refactor-design.md). The
+essentials:
 
 - **Identity claim.** A task worktree is recognized solely by the file
-  `<root>/.wt/task.json`. `wt task register` writes it (allocating ports along
-  the way); `wt task clear` removes it. Slot worktrees and the main checkout are
+  `<root>/.wt/task.json`. `wt claim register` writes it (allocating ports along
+  the way); `wt claim clear` removes it. Slot worktrees and the main checkout are
   never given a claim.
 - **Global state.** The port registry and archive live under `~/.wt/`
   (override with `WT_STATE_DIR`), keyed per project. Commit nothing from
@@ -963,9 +1012,9 @@ See [`design.md` §40](design.md) for the full model. The essentials:
 
 | Command | Notes |
 | --- | --- |
-| `wt task register [--slug S] [--branch B] [--type T] [--port ROLE=PORT]… [--label L]` | Create or update this worktree's claim. Idempotent. Prints the claim as `KEY=VALUE` (`port.<role>=<n>` per port). |
-| `wt task read [--json]` | Print the claim. Exit 4 if missing/corrupt/`version != 1`. |
-| `wt task clear` | Remove the claim (idempotent; leaves the registry alone). |
+| `wt claim register [--slug S] [--branch B] [--type T] [--port ROLE=PORT]… [--label L]` | Create or update this worktree's claim. Idempotent. Prints the claim as `KEY=VALUE` (`port.<role>=<n>` per port). |
+| `wt claim read [--json]` | Print the claim. Exit 4 if missing/corrupt/`version != 1`. |
+| `wt claim clear` | Remove the claim (idempotent; leaves the registry alone). |
 | `wt task slug [--branch B]` | Derive a slug from a branch name (pure; no side effects). |
 | `wt task branch <slug> [--type T]` | Expand `[task].branch_pattern` (pure). |
 | `wt port claim [--slug S] [--role NAME]…` | Allocate the lowest free port per role (default: all declared roles). Idempotent per `(slug, role)`. |
@@ -973,6 +1022,12 @@ See [`design.md` §40](design.md) for the full model. The essentials:
 | `wt port list [--slug S] [--json]` | Long TSV `slug<TAB>role<TAB>port<TAB>created_at`, or a JSON array. |
 | `wt proc stop --cwd DIR [--json]` | TERM→KILL every process whose **cwd** is inside DIR (never by name). Always exit 0. |
 | `wt archive --slug S --path P… [--budget SEC] [--max-bytes N]` | Best-effort snapshot into `~/.wt/archive/<key>/<slug>/`. Always exit 0. |
+| `wt env materialize [--app NAME] [--force]` | Render the `[env]` manifest: seed (from main) + generated values with `${slug}`/`${port.<role>}`/`${env.<KEY>}`. |
+| `wt env show [--json]` | Resolve the effective runtime (last file wins) per app and key. |
+| `wt env get <KEY> [--app NAME]` | Print one effective value. |
+| `wt env copy --from-main [--app NAME]` | Slot mode: copy the manifest's files from main (never clobbers). |
+| `wt check [--json]` | Run the declarative `[[check]]` probes; exit 1 when any fails. |
+| `wt teardown [--json]` | Canonical teardown: stop → archive → release ports → clear claim (best-effort; always exit 0). |
 | `wt assert --mode main\|slot\|task` | Classify the current worktree; exit 3 on mismatch. |
 | `wt current [--json]` | Now includes `mode=` and (task mode) `slug=` + `port.<role>=<n>`. |
 
@@ -984,30 +1039,88 @@ wrong place, register the claim, and read out whatever the app needs:
 
 ```sh
 wt assert --mode task || exit 3              # only ever run inside a task worktree
-claim="$(wt task register)"                  # idempotent: reprints an existing claim
+claim="$(wt claim register)"                 # idempotent: reprints an existing claim
 slug="$(printf '%s\n' "$claim" | sed -n 's/^slug=//p')"
+# With an [env] manifest, one command renders seed + per-task env values:
+wt env materialize                           # ${slug}/${port.<role>} -> env files
+# Without a manifest, read ports and generate env yourself:
 gateway="$(printf '%s\n' "$claim" | sed -n 's/^port.gateway=//p')"
 web="$(printf '%s\n' "$claim" | sed -n 's/^port.web=//p')"
-# …generate the project's env file / install deps (wt does not do this)…
+# …install deps / generate env…
 # need another app's port at runtime? allocate by role on demand:
 wt port claim --slug "$slug" --role oss-proxy   # → port.oss-proxy=5601
 ```
 
 ### 16.3 Writing a teardown hook
 
-Teardown runs before the orchestrator removes the worktree. Stop the worktree's
-own processes, release its ports, optionally archive scratch output, then clear
-the claim:
+Teardown runs before the orchestrator removes the worktree. `wt teardown` wraps
+the canonical sequence — stop this worktree's processes, archive the declared
+paths, release its ports, clear the claim — so the hook is usually one line:
+
+```sh
+wt teardown
+```
+
+The order is **stop → archive → release → clear**, and every step is
+best-effort (the command always exits 0), so it is safe as a hook body. Expand
+it by hand when you need to interleave project-specific steps:
 
 ```sh
 wt proc stop --cwd "$PWD"                    # only this worktree's processes
-wt port release --slug "$slug"               # free every role this slug held
 wt archive --slug "$slug" --path scratch --path logs   # best-effort, always 0
-wt task clear
+wt port release --slug "$slug"               # free every role this slug held
+wt claim clear
 ```
 
-### 16.4 Notes and gotchas
+`[task].archive_paths` supplies the default `--path` list used by `wt teardown`
+and `wt archive`.
 
+### 16.5 The env plane (`[env]`)
+
+`wt env` is an **optional module**, active only when `.wt.toml` has an `[env]`
+section. It implements a file chain plus three placeholder classes — no
+conditionals, loops, or dotenv semantics.
+
+```toml
+[env.gateway]
+dir          = "apps/gateway"                                  # base for the paths below
+files        = [".env", ".env.development", ".env.development.local"]
+seed         = "scripts/seed/gateway.env"                     # read from the main worktree
+seed_target  = ".env.development"                              # where the seed is written
+gen          = ".env.development.local"                        # where values are written
+copy_from_main = [".env.development", ".env.development.local"]  # `wt env copy` list
+[env.gateway.values]
+PORT = "${port.gateway}"            # a claimed port
+DB   = "data/g.${slug}.sqlite"      # the slug
+```
+
+- **Placeholders:** `${slug}`, `${port.<role>}`, `${env.<KEY>}` (the last
+  resolves against the same app's declared values).
+- `wt env materialize` writes the seed and generated values, never clobbering an
+  existing file unless `--force`.
+- `wt env show`/`get` read the `files` chain (last file wins), matching how the
+  apps themselves load env.
+- `wt env copy --from-main` is the simple slot-mode path (fixed ports, no claim).
+
+### 16.6 Declarative checks (`[[check]]`)
+
+```toml
+[[check]]
+name   = "api"
+url    = "http://localhost:${port.gateway}/api/v1/models"
+expect = 200
+[[check]]
+name     = "database"
+file     = "apps/gateway/data/gateway.${slug}.sqlite"
+nonempty = true
+```
+
+`wt check` runs each probe (`url` [+ optional `expect`], or `file` [+ optional
+`nonempty`]), prints human output or `--json`, and exits `0` when all pass, `1`
+when any fails, `2` on a usage error. It is read-only — it never starts or stops
+a server. Per-probe timeout: `--timeout SEC` or `WT_CHECK_TIMEOUT` (default 3s).
+
+### 16.4 Notes and gotchas
 - `wt sync` **skips** task worktrees, so a dirty or detached one never blocks a
   slot sync; `wt remove` refuses a task worktree (delegate removal to the
   orchestrator, after teardown).

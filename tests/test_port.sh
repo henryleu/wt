@@ -183,9 +183,9 @@ gateway = "18100-18199"
 web = "18200-18299"
 EOF
 T7="$(t_add_task p-seven)"
-(cd "$T7" && "$WT" task register >/dev/null 2>&1) || fail "register p-seven"
+(cd "$T7" && "$WT" claim register >/dev/null 2>&1) || fail "register p-seven"
 (cd "$T7" && "$WT" port claim --slug p-seven --role oss-proxy >/dev/null 2>&1) || fail "claim new role"
-claim="$(cd "$T7" && "$WT" task read 2>/dev/null)"
+claim="$(cd "$T7" && "$WT" claim read 2>/dev/null)"
 assert_contains "claim gained oss-proxy" "$claim" "port.oss-proxy="
 assert_contains "claim kept gateway" "$claim" "port.gateway="
 

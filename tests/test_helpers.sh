@@ -88,7 +88,7 @@ EOF
 }
 
 # t_add_task <slug> [type]: create a TASK-mode worktree (branch <type>/<slug>)
-# and print its path. The claim file is NOT created (call `wt task register`).
+# and print its path. The claim file is NOT created (call `wt claim register`).
 t_add_task() {
     local slug="$1" type="${2:-task}" path
     path="$WORKTREES/project-$slug"

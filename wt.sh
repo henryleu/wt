@@ -10,7 +10,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly WT_VERSION="0.1.0"
+readonly WT_VERSION="0.2.0"
 readonly WT_PROG="wt"
 readonly LOCK_TIMEOUT="${WT_LOCK_TIMEOUT:-60}" # seconds before failing lock wait
 readonly WT_COMMIT_TIMEOUT="${WT_COMMIT_TIMEOUT:-300}" # seconds per coding-agent call for wt commit
@@ -198,7 +198,17 @@ cfg_merge_push()    { cfg_get merge.push 'true'; }
 # Number of merged-branch commit subjects to embed in the no-ff merge message
 # (git merge --log=N). 0/false disables the changelog; true uses git's default.
 cfg_merge_log()     { cfg_get merge.log '"20"'; }
-cfg_hook_post()     { cfg_get hooks.post_setup '""'; }
+# cfg_hook_setup: the setup hook. "hooks.setup" wins; "hooks.post_setup" is the
+# legacy name, accepted for one release (see refactor-design.md §4.4).
+cfg_hook_setup() {
+    local v
+    v="$(cfg_get hooks.setup '""')"
+    [ -n "$v" ] || v="$(cfg_get hooks.post_setup '""')"
+    printf '%s' "$v"
+}
+
+# cfg_hook_teardown: the teardown hook, run before a worktree is removed.
+cfg_hook_teardown() { cfg_get hooks.teardown '""'; }
 cfg_commit_agent()  { cfg_get commit.agent '""'; }
 cfg_commit_model()  { cfg_get commit.model '""'; }
 cfg_commit_push()   { cfg_get commit.push 'false'; }
@@ -354,6 +364,46 @@ slot_of_path() {
     # <base>/<name>, so the slot is what's between the base and the name.
     # Simple heuristic: if base is a prefix of root, report the basename.
     printf '%s\n' "$bas"
+}
+
+# ----------------------------------------------------------------------------
+# Lifecycle hooks (setup / teardown)
+#
+# Both phases share one channel; only the trigger differs. wt add runs setup,
+# wt remove runs teardown; an external orchestrator (task mode) calls the same
+# scripts itself. The hook receives WT_MODE so a shared script can branch.
+# ----------------------------------------------------------------------------
+
+# run_project_hook PHASE WORKTREE SLOT BRANCH [MODE]
+#   PHASE is "setup" or "teardown". Reads the matching hook config, resolves
+#   it relative to the main worktree root, and runs it with WORKTREE as cwd.
+#   MODE (default "slot") is exported as WT_MODE.
+#   Returns 0 when no hook is configured or the hook succeeds; non-zero when
+#   the hook fails (caller decides whether that is fatal).
+run_project_hook() {
+    local phase="$1" wtroot="$2" slot="$3" branch="$4" mode="${5:-slot}" hook path
+    case "$phase" in
+        setup)    hook="$(cfg_hook_setup)" ;;
+        teardown) hook="$(cfg_hook_teardown)" ;;
+        *) die "internal: unknown hook phase '$phase'" ;;
+    esac
+    [ -n "$hook" ] || return 0
+    path="$WT_MAIN/$hook"
+    if [ ! -x "$path" ]; then
+        warn "$phase hook not executable or missing: $path"
+        return 0
+    fi
+    (
+        cd "$wtroot" 2>/dev/null || cd "$WT_MAIN"
+        export WT_MAIN_WORKTREE="$WT_MAIN"
+        export WT_WORKTREE="$wtroot"
+        export WT_SLOT="$slot"
+        export WT_BRANCH="$branch"
+        export WT_PROJECT_NAME="$WT_PROJECT_NAME"
+        export WT_MODE="$mode"
+        export WT_HOOK="$phase"
+        "$path"
+    )
 }
 
 # ============================================================================
@@ -754,8 +804,30 @@ mode_of_path() {
     fi
 }
 
+# pid_subtree ROOT: print ROOT and every descendant PID (space-separated).
+pid_subtree() {
+    local root="$1"
+    ps -axo pid=,ppid= 2>/dev/null | awk -v root="$root" '
+        { p[NR] = $1; q[NR] = $2; n = NR }
+        END {
+            inc[root] = 1
+            for (pass = 0; pass <= n; pass++)
+                for (i = 1; i <= n; i++)
+                    if (inc[q[i]]) inc[p[i]] = 1
+            for (k in inc) if (inc[k]) printf "%s ", k
+        }'
+}
+
 # cwd_pids DIR [EXCLUDE_PID...]: PIDs whose cwd is DIR or a descendant of it,
 # excluding any EXCLUDE_PID. Matches on cwd only -- never on process name.
+#
+# Two guards make this safe no matter how it is called:
+#   1. The whole pipeline runs from a neutral cwd (inside the subshell), so this
+#      function's own lsof/awk/sort children never match their own scan.
+#   2. The entire `wt` process subtree ($$ and descendants) is excluded, so a
+#      $(...) subshell that wraps `wt proc stop` is never signalled either.
+# $$ is the PID of the outer shell even inside subshells, so the subtree walk
+# always starts from the real `wt` process.
 cwd_pids() {
     local dir="$1"; shift
     local excl=" $* "
@@ -763,14 +835,18 @@ cwd_pids() {
     lsof="$(command -v lsof 2>/dev/null || true)"
     [ -n "$lsof" ] || lsof="/usr/sbin/lsof"
     [ -x "$lsof" ] || return 0
-    "$lsof" -n -d cwd -Fn 2>/dev/null | awk -v dir="$dir" -v excl="$excl" '
-        /^p/ { pid = substr($0, 2); next }
-        /^n/ {
-            path = substr($0, 2)
-            if (path != dir && index(path, dir "/") != 1) next
-            if (excl ~ (" " pid " ")) next
-            print pid
-        }' | sort -u
+    excl="$excl$(pid_subtree "$$")"
+    (
+        cd / 2>/dev/null || cd "$HOME" 2>/dev/null || true
+        "$lsof" -n -d cwd -Fn 2>/dev/null | awk -v dir="$dir" -v excl="$excl" '
+            /^p/ { pid = substr($0, 2); next }
+            /^n/ {
+                path = substr($0, 2)
+                if (path != dir && index(path, dir "/") != 1) next
+                if (excl ~ (" " pid " ")) next
+                print pid
+            }' | sort -u
+    )
 }
 
 # ----------------------------------------------------------------------------
@@ -814,6 +890,79 @@ cfg_task_port_range() {
 cfg_task_port_roles() {
     config_present || return 0
     yq -r '.task.port_ranges // {} | keys | .[]' "$(config_file)" 2>/dev/null | sed '/^$/d'
+}
+
+# cfg_task_required_roles: roles every new claim must carry a port for.
+cfg_task_required_roles() {
+    config_present || return 0
+    yq -r '.task.required_roles // [] | .[]' "$(config_file)" 2>/dev/null | sed '/^$/d'
+}
+
+# cfg_task_archive_paths: default --path list for `wt teardown`/`wt archive`.
+cfg_task_archive_paths() {
+    config_present || return 0
+    yq -r '.task.archive_paths // [] | .[]' "$(config_file)" 2>/dev/null | sed '/^$/d'
+}
+
+# ----------------------------------------------------------------------------
+# [env] manifest — optional, flow-agnostic env plane (refactor-design.md §5).
+# Only active when the section exists; wt implements a file chain plus a tiny
+# placeholder language, never project-specific dotenv semantics.
+# ----------------------------------------------------------------------------
+
+# cfg_env_present: true when at least one app is declared under [env].
+cfg_env_present() {
+    config_present || return 1
+    local n
+    n="$(yq -r '.env // {} | length' "$(config_file)" 2>/dev/null || echo 0)"
+    [ "${n:-0}" -gt 0 ] 2>/dev/null
+}
+
+# cfg_env_apps: newline list of app names under [env].
+cfg_env_apps() {
+    config_present || return 0
+    yq -r '.env // {} | keys | .[]' "$(config_file)" 2>/dev/null | sed '/^$/d'
+}
+
+# cfg_env_field APP FIELD: scalar string field ("" when unset).
+cfg_env_field() {
+    local app="$1" field="$2"
+    config_present || return 0
+    yq -r ".env.\"$app\".\"$field\" // \"\"" "$(config_file)" 2>/dev/null || true
+}
+
+# cfg_env_list APP FIELD: newline list from an array field.
+cfg_env_list() {
+    local app="$1" field="$2"
+    config_present || return 0
+    yq -r ".env.\"$app\".\"$field\" // [] | .[]" "$(config_file)" 2>/dev/null | sed '/^$/d'
+}
+
+# cfg_env_value_keys APP: newline list of declared value keys.
+cfg_env_value_keys() {
+    local app="$1"
+    config_present || return 0
+    yq -r ".env.\"$app\".values // {} | keys | .[]" "$(config_file)" 2>/dev/null | sed '/^$/d'
+}
+
+# cfg_env_value APP KEY: raw (unexpanded) declared value.
+cfg_env_value() {
+    local app="$1" key="$2"
+    config_present || return 0
+    yq -r ".env.\"$app\".values.\"$key\" // \"\"" "$(config_file)" 2>/dev/null || true
+}
+
+# cfg_check_count: number of [[check]] probes (0 when none).
+cfg_check_count() {
+    if ! config_present; then printf '0'; return; fi
+    yq -r '.check // [] | length' "$(config_file)" 2>/dev/null || printf '0'
+}
+
+# cfg_check_field IDX FIELD: scalar field of the IDX-th [[check]] ("" when unset).
+cfg_check_field() {
+    local i="$1" f="$2"
+    config_present || return 0
+    yq -r ".check[$i].\"$f\" // \"\"" "$(config_file)" 2>/dev/null || true
 }
 
 # task_role_range ROLE: range for ROLE from port_ranges, else the declared
@@ -895,6 +1044,11 @@ validate_task_config() {
     case "$r" in
         ''|*[!0-9]*) die "configuration error: task.archive_max_bytes must be a positive integer (got '$r')" ;;
     esac
+    local req
+    while IFS= read -r req; do
+        [ -n "$req" ] || continue
+        valid_role_name "$req" || die "configuration error: invalid task.required_roles entry '$req' (want ^[a-z][a-z0-9_-]*$)"
+    done < <(cfg_task_required_roles)
 }
 
 # ----------------------------------------------------------------------------
@@ -1050,8 +1204,8 @@ wt — Worktree Tool
 Manage long-lived Git worktree workspaces for coding agents.
 
 USAGE
-  wt add <slot> [branch]     create a persistent worktree slot
-  wt remove <slot>           remove a worktree slot (via git, safe by default)
+  wt add <slot> [branch]     create a persistent worktree slot (runs setup hook)
+  wt remove <slot>           remove a worktree slot (runs teardown hook)
   wt switch <branch>         switch this worktree's branch (new branches from main)
   wt commit [message]        commit changes (agent-assisted, or explicit message)
   wt merge                   merge current branch into the main worktree (no cd)
@@ -1059,11 +1213,21 @@ USAGE
   wt list                    list all worktrees
   wt status                  show current workspace status
   wt current [--json]        machine-friendly current context
-  wt task <sub>              task-worktree identity claim (register|read|clear|slug|branch)
-  wt port <sub>              per-task port registry (claim|release|list)
-  wt proc stop --cwd DIR     stop processes whose cwd is inside DIR
-  wt archive --slug S --path P...   snapshot paths for a task
+
+Toolkit (flow-agnostic; callable from any worktree or an external orchestrator)
+  wt claim register|read|clear      this worktree's identity claim (.wt/task.json)
+  wt port claim|release|list        per-project port registry
+  wt proc stop --cwd DIR            stop processes whose cwd is inside DIR
+  wt archive --slug S --path P...   snapshot paths for a worktree
+  wt env materialize|show|get|copy  declarative env plane ([env] manifest)
+  wt check [--json]                 run declarative health probes ([[check]])
+  wt teardown [--json]              canonical teardown (stop,archive,release,clear)
   wt assert --mode main|slot|task   assert the current worktree's mode
+
+Lifecycle helpers
+  wt task slug|branch        branch<->slug helpers for ephemeral task branches
+
+Setup
   wt config get <key>        read a .wt.toml value (e.g. main_branch, merge.remote)
   wt config set <key> <val>  write a .wt.toml value
   wt init                    generate a default .wt.toml in the main worktree
@@ -1091,7 +1255,8 @@ CONFIG (.wt.toml, committed to Git, read from the main worktree)
   merge.remote           remote for fetch/push (default origin)
   merge.push             whether wt merge/wt sync pushes after success (default true)
   merge.log              commits from the merged branch embedded in the merge message (default 20; 0/off disables)
-  hooks.post_setup       optional script run after a worktree is created
+  hooks.setup            script run after a worktree is created (was hooks.post_setup)
+  hooks.teardown         script run before a worktree is removed
   commit.agent           coding agent for wt commit: pi | claude (default: auto-detect)
   commit.model           model override for wt commit (empty = agent default)
   commit.push            push after a successful wt commit (default false)
@@ -1099,12 +1264,24 @@ CONFIG (.wt.toml, committed to Git, read from the main worktree)
   task.types             allowed ${type} values (first is the default)
   task.port_ranges       role(app name) -> "lo-hi" port range (any number of roles)
   task.port_range_default  fallback range for undeclared roles
+  task.required_roles    roles every new claim must carry a port for
+  task.archive_paths     paths snapshotted by wt teardown / wt archive
   task.archive_budget    wt archive default time budget in seconds (default 60)
   task.archive_max_bytes wt archive per-file size cap in bytes (default 26214400)
+  [env.<app>]            optional env plane: dir, files, seed, seed_target, gen,
+                         copy_from_main, and a [env.<app>.values] map using
+                         ${slug} / ${port.<role>} / ${env.<KEY>}
+  [[check]]              optional health probe: name + (url[+expect] | file[+nonempty])
 
 ENVIRONMENT
   WT_LOCK_TIMEOUT        seconds to wait for the project lock (default 60)
   WT_STATE_DIR           user-level state dir (default ~/.wt; ports, archive, locks)
+  WT_CHECK_TIMEOUT       seconds per wt check probe (default 3)
+
+HOOK ENVIRONMENT (hooks.setup / hooks.teardown)
+  WT_MAIN_WORKTREE WT_WORKTREE WT_SLOT WT_BRANCH WT_PROJECT_NAME
+  WT_MODE                slot | task (which topology triggered the hook)
+  WT_HOOK                setup | teardown (which phase is running)
 EOF
 }
 
@@ -1146,6 +1323,17 @@ cmd_doctor() {
         fi
     else
         check "" ".wt.toml found" "Expected at $(config_file)"
+    fi
+
+    if config_present; then
+        local hs ht nchk
+        hs="$(cfg_hook_setup)"
+        ht="$(cfg_hook_teardown)"
+        if [ -n "$hs" ]; then check 1 "hooks.setup configured ($hs)"; fi
+        if [ -n "$ht" ]; then check 1 "hooks.teardown configured ($ht)"; fi
+        if cfg_env_present; then check 1 "env plane configured ($(cfg_env_apps | tr '\n' ' '))"; fi
+        nchk="$(cfg_check_count)"
+        if [ "${nchk:-0}" -gt 0 ] 2>/dev/null; then check 1 "health checks declared ($nchk)"; fi
     fi
 
     if git rev-parse --git-dir >/dev/null 2>&1; then
@@ -1362,7 +1550,7 @@ cmd_add() {
         die "slot '$slot' is already a registered worktree at $target"
     fi
 
-    local main_branch candidate exists
+    local main_branch exists
     main_branch="$(cfg_main_branch)"
     git rev-parse -q --verify "refs/heads/$main_branch" >/dev/null 2>&1 || \
         die "configured main branch '$main_branch' not found"
@@ -1388,28 +1576,10 @@ cmd_add() {
             || die "failed to create worktree and branch '$branch' from '$main_branch'"
     fi
 
-    # ---- post_setup hook ----
-    local hook
-    hook="$(cfg_hook_post)"
-    if [ -n "$hook" ]; then
-        local hook_path="$WT_MAIN/$hook"
-        [ -x "$hook_path" ] || warn "post_setup hook not executable or missing: $hook_path"
-        if [ -x "$hook_path" ]; then
-            if (
-                cd "$target"
-                export WT_MAIN_WORKTREE="$WT_MAIN"
-                export WT_WORKTREE="$target"
-                export WT_SLOT="$slot"
-                export WT_BRANCH="$branch"
-                export WT_PROJECT_NAME="$WT_PROJECT_NAME"
-                "$hook_path"
-            ); then
-                :
-            else
-                warn "post_setup hook failed; worktree kept at $target for debugging"
-                die "post_setup hook '$hook' failed"
-            fi
-        fi
+    # ---- setup hook ----
+    if ! run_project_hook setup "$target" "$slot" "$branch" slot; then
+        warn "setup hook failed; worktree kept at $target for debugging"
+        die "setup hook '$(cfg_hook_setup)' failed"
     fi
 
     printf 'Created worktree:\n'
@@ -1476,14 +1646,23 @@ cmd_remove() {
 
     [ -f "$(task_claim_file "$target")" ] && die "task worktree; remove it via its orchestrator"
 
-    [ -d "$target" ] || die "slot '$slot' has no worktree at $target"
+    # A registered worktree can outlive its directory (accidental rm -rf), so
+    # resolve membership and directory presence independently. Teardown still
+    # runs when the directory is gone: ports/processes may need releasing.
+    local registered=false dirpresent=false
+    [ -d "$target" ] && dirpresent=true
+    if printf '%s\n' "$(worktree_roots)" | grep -Fxq "$target"; then
+        registered=true
+    fi
 
-    # ensure it maps to a real registered Git worktree, not arbitrary dir
-    local mapped=""
-    mapped="$( { worktree_roots | grep -Fx "$target" || true; } )"
-    [ -n "$mapped" ] || die "path $target is not a registered Git worktree (not removing)"
+    if [ "$registered" = "false" ]; then
+        if [ "$dirpresent" = "true" ]; then
+            die "path $target exists but is not a registered Git worktree (not removing)"
+        fi
+        die "slot '$slot' has no worktree at $target"
+    fi
 
-    if ! is_clean "$target"; then
+    if [ "$dirpresent" = "true" ] && ! is_clean "$target"; then
         if [ "$force" = "true" ]; then
             warn "worktree is dirty; removing with --force"
         else
@@ -1491,18 +1670,34 @@ cmd_remove() {
         fi
     fi
 
+    local br
+    br="$(branch_of_worktree "$target")"
+
     project_lock_acquire remove
     trap project_lock_release EXIT
 
-    if [ "$force" = "true" ]; then
-        git worktree remove --force "$target" \
-            || die "failed to remove worktree at $target"
-    else
-        git worktree remove "$target" \
-            || die "failed to remove worktree at $target"
+    # Teardown runs BEFORE the worktree disappears, while its files and
+    # processes are still reachable. A failing hook is a warning, not a hard
+    # stop: removal should still complete (the caller can clean up by hand).
+    if ! run_project_hook teardown "$target" "$slot" "$br" slot; then
+        warn "teardown hook failed; continuing with removal (some resources may need manual cleanup)"
     fi
 
-    info "removed worktree: $target (branch retained)"
+    if [ "$dirpresent" = "true" ]; then
+        if [ "$force" = "true" ]; then
+            git worktree remove --force "$target" \
+                || die "failed to remove worktree at $target"
+        else
+            git worktree remove "$target" \
+                || die "failed to remove worktree at $target"
+        fi
+        info "removed worktree: $target (branch retained)"
+    else
+        # Directory already gone: drop the stale administrative entry so a
+        # rebuild can reuse the same path. The branch is left intact.
+        git -C "$WT_MAIN" worktree prune >/dev/null 2>&1 || true
+        warn "worktree directory was already absent; pruned stale Git metadata for $target (branch retained)"
+    fi
 }
 
 cmd_merge() {
@@ -2138,8 +2333,25 @@ cmd_sync() {
 }
 
 # ============================================================================
-# wt task
+# wt claim (identity) and wt task (lifecycle-specific helpers)
+#
+# A "claim" is a neutral identity declaration for THIS worktree: a slot or a
+# task may declare one. Only branch<->slug derivation stays under `wt task`,
+# because it depends on the ephemeral-lifecycle branch template.
 # ============================================================================
+
+cmd_claim() {
+    require_project
+    validate_config
+    local sub="${1:-}"
+    [ $# -ge 1 ] && shift || true
+    case "$sub" in
+        register) cmd_claim_register "$@" ;;
+        read)     cmd_claim_read "$@" ;;
+        clear)    cmd_claim_clear "$@" ;;
+        ''|*)     usage_error "claim requires a subcommand (register|read|clear)" ;;
+    esac
+}
 
 cmd_task() {
     require_project
@@ -2147,35 +2359,34 @@ cmd_task() {
     local sub="${1:-}"
     [ $# -ge 1 ] && shift || true
     case "$sub" in
-        register) cmd_task_register "$@" ;;
-        read)     cmd_task_read "$@" ;;
-        clear)    cmd_task_clear "$@" ;;
         slug)     cmd_task_slug "$@" ;;
         branch)   cmd_task_branch "$@" ;;
-        ''|*)     usage_error "task requires a subcommand (register|read|clear|slug|branch)" ;;
+        register|read|clear)
+            usage_error "'wt task $sub' was renamed to 'wt claim $sub'" ;;
+        ''|*)     usage_error "task requires a subcommand (slug|branch)" ;;
     esac
 }
 
-cmd_task_register() {
+cmd_claim_register() {
     local slug="" branch="" type="" label="" pinned="" want_type=0
     while [ $# -gt 0 ]; do
         case "$1" in
-            --slug)   [ $# -ge 2 ] || usage_error "task register: --slug requires a value";   slug="$2";   shift 2 ;;
-            --branch) [ $# -ge 2 ] || usage_error "task register: --branch requires a value"; branch="$2"; shift 2 ;;
-            --type)   [ $# -ge 2 ] || usage_error "task register: --type requires a value";   type="$2"; want_type=1; shift 2 ;;
-            --label)  [ $# -ge 2 ] || usage_error "task register: --label requires a value";  label="$2";  shift 2 ;;
+            --slug)   [ $# -ge 2 ] || usage_error "claim register: --slug requires a value";   slug="$2";   shift 2 ;;
+            --branch) [ $# -ge 2 ] || usage_error "claim register: --branch requires a value"; branch="$2"; shift 2 ;;
+            --type)   [ $# -ge 2 ] || usage_error "claim register: --type requires a value";   type="$2"; want_type=1; shift 2 ;;
+            --label)  [ $# -ge 2 ] || usage_error "claim register: --label requires a value";  label="$2";  shift 2 ;;
             --port)
-                [ $# -ge 2 ] || usage_error "task register: --port requires ROLE=PORT"
+                [ $# -ge 2 ] || usage_error "claim register: --port requires ROLE=PORT"
                 case "$2" in
                     *[=]*) ;;
-                    *) usage_error "task register: --port expects ROLE=PORT (got '$2')" ;;
+                    *) usage_error "claim register: --port expects ROLE=PORT (got '$2')" ;;
                 esac
                 pinned="$pinned$2
 "
                 shift 2
                 ;;
-            -*) usage_error "task register: unknown option '$1'" ;;
-            *)  usage_error "task register: unexpected argument '$1'" ;;
+            -*) usage_error "claim register: unknown option '$1'" ;;
+            *)  usage_error "claim register: unexpected argument '$1'" ;;
         esac
     done
 
@@ -2185,33 +2396,33 @@ cmd_task_register() {
         [ -n "$line" ] || continue
         role="${line%%=*}"
         port="${line#*=}"
-        valid_role_name "$role" || die "task register: invalid role '$role' in --port (want ^[a-z][a-z0-9_-]*$)"
+        valid_role_name "$role" || die "claim register: invalid role '$role' in --port (want ^[a-z][a-z0-9_-]*$)"
         case "$port" in
-            ''|*[!0-9]*) die "task register: invalid port '$port' in --port $line" ;;
+            ''|*[!0-9]*) die "claim register: invalid port '$port' in --port $line" ;;
         esac
-        [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "task register: port out of range in --port $line"
+        [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "claim register: port out of range in --port $line"
     done <<< "$pinned"
     local dupr
     dupr="$(printf '%s\n' "$pinned" | sed '/^$/d' | cut -d= -f1 | sort | uniq -d)"
-    [ -z "$dupr" ] || die "task register: duplicate --port role '$dupr'"
+    [ -z "$dupr" ] || die "claim register: duplicate --port role '$dupr'"
 
     # ---- branch / slug / type ----
     [ -n "$branch" ] || branch="$(current_branch)"
-    [ -n "$branch" ] || die "task register: current worktree is detached; pass --branch"
+    [ -n "$branch" ] || die "claim register: current worktree is detached; pass --branch"
     [ -n "$slug" ] || slug="$(task_slug_from_branch "$branch")"
-    valid_slug "$slug" || die "task register: derived slug '$slug' is invalid; pass --slug"
+    valid_slug "$slug" || die "claim register: derived slug '$slug' is invalid; pass --slug"
 
     local pat t found
     pat="$(cfg_task_branch_pattern)"
     if [ "$want_type" -eq 1 ]; then
         found=0
         for t in $(cfg_task_types_space); do [ "$t" = "$type" ] && found=1; done
-        [ "$found" -eq 1 ] || die "task register: unknown --type '$type' (allowed: $(cfg_task_types_space))"
+        [ "$found" -eq 1 ] || die "claim register: unknown --type '$type' (allowed: $(cfg_task_types_space))"
     else
         case "$pat" in
             *'${type}'*)
                 if t="$(task_type_from_branch "$branch")"; then type="$t"
-                else die "task register: cannot resolve \${type} from branch '$branch'; pass --type"; fi
+                else die "claim register: cannot resolve \${type} from branch '$branch'; pass --type"; fi
                 ;;
             *) type="" ;;
         esac
@@ -2222,7 +2433,7 @@ cmd_task_register() {
     if task_claim_exists "$root"; then
         task_claim_load "$root" || rc=$?
         if [ "$rc" -ne 0 ]; then
-            die "task register: ${TASK_CLAIM_ERR:-corrupt claim} (use 'wt task clear' to reset, or fix the file)"
+            die "claim register: ${TASK_CLAIM_ERR:-corrupt claim} (use 'wt claim clear' to reset, or fix the file)"
         fi
         if [ -z "$pinned" ]; then
             note "claim exists"
@@ -2236,7 +2447,7 @@ cmd_task_register() {
             role="${line%%=*}"
             port="${line#*=}"
             TASK_PORTS="$(ports_set "$TASK_PORTS" "$role" "$port")"
-            registry_upsert "$TASK_SLUG" "$role" "$port" || die "task register: cannot update port registry"
+            registry_upsert "$TASK_SLUG" "$role" "$port" || die "claim register: cannot update port registry"
         done <<< "$pinned"
         registry_lock_release
         TASK_PORTS="$(ports_sorted "$TASK_PORTS")"
@@ -2270,7 +2481,7 @@ cmd_task_register() {
         role="${line%%=*}"
         port="${line#*=}"
         TASK_PORTS="$(ports_set "$TASK_PORTS" "$role" "$port")"
-        registry_upsert "$slug" "$role" "$port" || die "task register: cannot write port registry"
+        registry_upsert "$slug" "$role" "$port" || die "claim register: cannot write port registry"
     done <<< "$pinned"
     local arc p
     while IFS= read -r r; do
@@ -2281,41 +2492,50 @@ cmd_task_register() {
             TASK_PORTS="$(ports_set "$TASK_PORTS" "$r" "$p")"
         elif [ "$arc" -eq 1 ]; then
             registry_lock_release
-            die "task register: no port range configured for role '$r' (declare [task.port_ranges].$r or task.port_range_default)"
+            die "claim register: no port range configured for role '$r' (declare [task.port_ranges].$r or task.port_range_default)"
         else
             registry_lock_release
-            die "task register: no free port for role '$r' in range $(task_role_range "$r" 2>/dev/null || echo '?')"
+            die "claim register: no free port for role '$r' in range $(task_role_range "$r" 2>/dev/null || echo '?')"
         fi
     done <<< "$alloc_roles"
     registry_lock_release
 
     TASK_PORTS="$(ports_sorted "$TASK_PORTS")"
+
+    # required_roles: every declared role must resolve to a port in the claim.
+    local req
+    while IFS= read -r req; do
+        [ -n "$req" ] || continue
+        [ -n "$(ports_get "$TASK_PORTS" "$req")" ] || \
+            die "claim register: required role '$req' has no port (declare [task.port_ranges].$req or pin --port $req=PORT)"
+    done < <(cfg_task_required_roles)
+
     task_claim_write "$root"
     warn_if_claim_untracked "$root"
     task_claim_print
 }
 
-cmd_task_read() {
+cmd_claim_read() {
     local json=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --json) json=true; shift ;;
-            -*)     usage_error "task read: unknown option '$1'" ;;
-            *)      usage_error "task read: unexpected argument '$1'" ;;
+            -*)     usage_error "claim read: unknown option '$1'" ;;
+            *)      usage_error "claim read: unexpected argument '$1'" ;;
         esac
     done
     local root="$WT_CURRENT_ROOT" rc=0
     task_claim_load "$root" || rc=$?
     if [ "$rc" -ne 0 ]; then
         printf '%s: %s\n' "$WT_PROG" "${TASK_CLAIM_ERR:-no claim at $root}" >&2
-        printf '%s: create it with "wt task register", or reset with "wt task clear"\n' "$WT_PROG" >&2
+        printf '%s: create it with "wt claim register", or reset with "wt claim clear"\n' "$WT_PROG" >&2
         exit 4
     fi
     if [ "$json" = "true" ]; then task_claim_serialize; else task_claim_print; fi
 }
 
-cmd_task_clear() {
-    [ $# -eq 0 ] || usage_error "task clear: unexpected arguments"
+cmd_claim_clear() {
+    [ $# -eq 0 ] || usage_error "claim clear: unexpected arguments"
     local dir="$WT_CURRENT_ROOT/.wt"
     rm -f "$dir/task.json" 2>/dev/null || true
     rmdir "$dir" 2>/dev/null || true
@@ -2554,7 +2774,18 @@ cmd_proc_stop() {
     dir="$(cd -P "$dir" 2>/dev/null && pwd -P)" || dir="$dir"
 
     local pids p alive waited stopped="" killed=""
-    pids="$(cwd_pids "$dir" "$$" "${PPID:-0}")"
+    # Capture the PID list through a temp file (not a command substitution): a
+    # $(...) subshell would inherit DIR as its cwd and get matched by its own
+    # scan. cwd_pids already scans from a neutral cwd.
+    local pidfile
+    pidfile="$(mktemp "${TMPDIR:-/tmp}/wt-pids-XXXXXX" 2>/dev/null || true)"
+    if [ -n "$pidfile" ]; then
+        cwd_pids "$dir" "$$" "${PPID:-0}" > "$pidfile"
+        pids="$(cat "$pidfile")"
+        rm -f "$pidfile"
+    else
+        pids="$(cwd_pids "$dir" "$$" "${PPID:-0}")"
+    fi
     if [ -n "$pids" ]; then
         # shellcheck disable=SC2086
         kill -TERM $pids 2>/dev/null || true
@@ -2673,6 +2904,505 @@ cmd_archive() {
             copy_one_capped "$src" "$dest/$rel" "$maxbytes"
         fi
     done <<< "$paths"
+    return 0
+}
+
+# ============================================================================
+# wt env — declarative env plane (optional; needs an [env] manifest)
+# ============================================================================
+
+# bool_json N: "true" when N is 1, else "false".
+bool_json() { if [ "$1" = "1" ]; then printf 'true'; else printf 'false'; fi; }
+
+# env_app_dir APP: the app's base dir relative to a worktree root (default ".").
+env_app_dir() {
+    local d
+    d="$(cfg_env_field "$1" dir)"
+    [ -n "$d" ] || d="."
+    printf '%s' "$d"
+}
+
+# env_assert_app APP: fail when APP is not declared under [env]. Guards
+# --app NAME so a typo is an error instead of a silent no-op.
+env_assert_app() {
+    local want="$1"
+    printf '%s\n' "$(cfg_env_apps)" | grep -Fxq "$want" && return 0
+    die "env: unknown app '$want' (declared: $(cfg_env_apps | tr '\n' ' ' | sed 's/ $//'))"
+}
+
+# env_join ROOT DIR REL: join ROOT/DIR/REL, collapsing a "." DIR.
+env_join() {
+    local root="$1" dir="$2" rel="$3"
+    if [ "$dir" = "." ] || [ -z "$dir" ]; then
+        printf '%s/%s' "$root" "$rel"
+    else
+        printf '%s/%s/%s' "$root" "$dir" "$rel"
+    fi
+}
+
+# env_current_slug: claim slug when present, else the branch-derived slug.
+# Always returns 0 so a bare `slug="$(env_current_slug)"` is safe under set -e
+# even when there is no claim and no derivable slug.
+env_current_slug() {
+    local rc=0 br
+    task_claim_load "$WT_CURRENT_ROOT" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        printf '%s' "$TASK_SLUG"
+        return 0
+    fi
+    br="$(current_branch)"
+    if [ -n "$br" ]; then task_slug_from_branch "$br"; fi
+    return 0
+}
+
+# env_current_ports: claim ports ("role<TAB>port" lines) or empty. Always
+# returns 0 so a bare `ports="$(env_current_ports)"` is safe under set -e when
+# no claim exists (slots use the env plane without a claim).
+env_current_ports() {
+    local rc=0
+    task_claim_load "$WT_CURRENT_ROOT" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then printf '%s' "$TASK_PORTS"; fi
+    return 0
+}
+
+# env_key_from_file FILE KEY: last assignment of KEY (quotes stripped).
+env_key_from_file() {
+    local file="$1" key="$2" val
+    [ -f "$file" ] || return 1
+    val="$(awk -v k="$key" '
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            sub(/^[ \t]+/, "", line)
+            if (line ~ /^export[ \t]+/) sub(/^export[ \t]+/, "", line)
+            if (index(line, k "=") == 1) {
+                v = substr(line, length(k) + 2)
+                sub(/[ \t]+#.*$/, "", v)
+                found = 1
+            }
+        }
+        END { if (found) print v }
+    ' "$file")" || true
+    [ -n "$val" ] || return 1
+    case "$val" in
+        \"*\") val="${val#\"}"; val="${val%\"}" ;;
+        \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    printf '%s' "$val"
+}
+
+# env_expand_str VALUE SLUG PORTS APP [DEPTH]: expand the three placeholder
+# classes (${slug}, ${port.<role>}, ${env.<KEY>}). ${env.<KEY>} resolves against
+# the same app's declared values, bounded by DEPTH.
+env_expand_str() {
+    local val="$1" slug="$2" ports="$3" app="$4" depth="${5:-0}" r p inner key sub
+    val="${val//\$\{slug\}/$slug}"
+    while IFS=$'\t' read -r r p; do
+        [ -n "$r" ] || continue
+        val="${val//\$\{port.$r\}/$p}"
+    done <<< "$ports"
+    [ "$depth" -lt 10 ] || { printf '%s' "$val"; return 0; }
+    while :; do
+        case "$val" in
+            *'${env.'*) ;;
+            *) break ;;
+        esac
+        inner="${val#*\$\{env.}"
+        case "$inner" in
+            *'}'*) ;;
+            # malformed placeholder: no closing brace, so it can never
+            # resolve -- leave the value as-is instead of looping forever
+            *) break ;;
+        esac
+        key="${inner%%\}*}"
+        [ -n "$key" ] || break
+        sub="$(env_value_resolved "$app" "$key" "$slug" "$ports" $((depth + 1)) 2>/dev/null || true)"
+        val="${val//\$\{env.$key\}/$sub}"
+    done
+    printf '%s' "$val"
+}
+
+# env_value_resolved APP KEY SLUG PORTS [DEPTH]: expand a declared value.
+env_value_resolved() {
+    local app="$1" key="$2" slug="$3" ports="$4" depth="${5:-0}" raw
+    raw="$(cfg_env_value "$app" "$key")"
+    env_expand_str "$raw" "$slug" "$ports" "$app" "$depth"
+}
+
+# env_chain_get APP KEY ROOT: resolve KEY across the app's file chain, last file
+# wins. Prints "<value><TAB><source-rel>"; returns 1 when KEY is absent.
+env_chain_get() {
+    local app="$1" key="$2" root="$3" dir rel f v out="" src=""
+    dir="$(env_app_dir "$app")"
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        f="$(env_join "$root" "$dir" "$rel")"
+        [ -f "$f" ] || continue
+        if v="$(env_key_from_file "$f" "$key")"; then
+            out="$v"; src="$rel"
+        fi
+    done < <(cfg_env_list "$app" files)
+    [ -n "$src" ] || return 1
+    printf '%s\t%s' "$out" "$src"
+}
+
+cmd_env() {
+    require_project
+    validate_config
+    local sub="${1:-}"
+    [ $# -ge 1 ] && shift || true
+    case "$sub" in
+        materialize) cmd_env_materialize "$@" ;;
+        show)        cmd_env_show "$@" ;;
+        get)         cmd_env_get "$@" ;;
+        copy)        cmd_env_copy "$@" ;;
+        ''|*)        usage_error "env requires a subcommand (materialize|show|get|copy)" ;;
+    esac
+}
+
+# env_materialize_app APP SLUG PORTS FORCE: seed + generated values for one app.
+env_materialize_app() {
+    local app="$1" slug="$2" ports="$3" force="$4" dir root
+    dir="$(env_app_dir "$app")"
+    root="$WT_CURRENT_ROOT"
+
+    local seed seed_target seed_src seed_dst
+    seed="$(cfg_env_field "$app" seed)"
+    if [ -n "$seed" ]; then
+        seed_src="$WT_MAIN/$seed"
+        [ -f "$seed_src" ] || die "env materialize: missing seed $seed_src"
+        seed_target="$(cfg_env_field "$app" seed_target)"
+        [ -n "$seed_target" ] || die "env materialize: [env.$app] has seed but no seed_target"
+        seed_dst="$(env_join "$root" "$dir" "$seed_target")"
+        if [ -e "$seed_dst" ] && [ "$force" != "true" ]; then
+            note "env materialize: keep existing $seed_dst"
+        else
+            mkdir -p "$(dirname "$seed_dst")" || die "env materialize: cannot create $(dirname "$seed_dst")"
+            { printf '# Generated by wt env materialize — base from %s\n' "$seed"; cat "$seed_src"; } > "$seed_dst" \
+                || die "env materialize: cannot write $seed_dst"
+            info "wrote $seed_dst"
+        fi
+    fi
+
+    local keys gen gen_dst
+    keys="$(cfg_env_value_keys "$app")"
+    [ -n "${keys//[[:space:]]/}" ] || return 0
+    gen="$(cfg_env_field "$app" gen)"
+    [ -n "$gen" ] || die "env materialize: [env.$app] declares values but no gen"
+    gen_dst="$(env_join "$root" "$dir" "$gen")"
+    if [ -e "$gen_dst" ] && [ "$force" != "true" ]; then
+        note "env materialize: keep existing $gen_dst"
+        return 0
+    fi
+    mkdir -p "$(dirname "$gen_dst")" || die "env materialize: cannot create $(dirname "$gen_dst")"
+    local k v
+    {
+        printf '# Generated by wt env materialize (slug %s)\n' "${slug:-?}"
+        while IFS= read -r k; do
+            [ -n "$k" ] || continue
+            v="$(env_value_resolved "$app" "$k" "$slug" "$ports" 0)"
+            printf '%s=%s\n' "$k" "$v"
+        done <<< "$keys"
+    } > "$gen_dst" || die "env materialize: cannot write $gen_dst"
+    info "wrote $gen_dst"
+}
+
+cmd_env_materialize() {
+    cfg_env_present || die "no [env] section in $(config_file); nothing to materialize"
+    local app="" force=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --app)   [ $# -ge 2 ] || usage_error "env materialize: --app requires a value"; app="$2"; shift 2 ;;
+            --force|-f) force=true; shift ;;
+            -*)      usage_error "env materialize: unknown option '$1'" ;;
+            *)       usage_error "env materialize: unexpected argument '$1'" ;;
+        esac
+    done
+    local slug ports apps
+    slug="$(env_current_slug)"
+    ports="$(env_current_ports)"
+    if [ -n "$app" ]; then env_assert_app "$app"; apps="$app"; else apps="$(cfg_env_apps)"; fi
+    local a
+    while IFS= read -r a; do
+        [ -n "$a" ] || continue
+        env_materialize_app "$a" "$slug" "$ports" "$force"
+    done <<< "$apps"
+}
+
+cmd_env_show() {
+    cfg_env_present || die "no [env] section in $(config_file)"
+    local json=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) json=true; shift ;;
+            -*)     usage_error "env show: unknown option '$1'" ;;
+            *)      usage_error "env show: unexpected argument '$1'" ;;
+        esac
+    done
+    local slug ports apps
+    slug="$(env_current_slug)"
+    ports="$(env_current_ports)"
+    apps="$(cfg_env_apps)"
+    local a k out val src first_app first_k
+
+    if [ "$json" = "true" ]; then
+        printf '{"worktree":%s,"slug":%s,"ports":%s,"env":{' \
+            "$(json_escape "$WT_CURRENT_ROOT")" "$(json_escape "$slug")" "$(ports_json "$ports")"
+        first_app=1
+        while IFS= read -r a; do
+            [ -n "$a" ] || continue
+            [ "$first_app" -eq 1 ] || printf ','
+            first_app=0
+            printf '%s:{' "$(json_escape "$a")"
+            first_k=1
+            while IFS= read -r k; do
+                [ -n "$k" ] || continue
+                [ "$first_k" -eq 1 ] || printf ','
+                first_k=0
+                out="$(env_chain_get "$a" "$k" "$WT_CURRENT_ROOT" 2>/dev/null || true)"
+                val=""; src=""
+                if [ -n "$out" ]; then val="${out%%$'\t'*}"; src="${out#*$'\t'}"; fi
+                printf '%s:{"value":%s,"source":%s}' "$(json_escape "$k")" "$(json_escape "$val")" "$(json_escape "$src")"
+            done < <(cfg_env_value_keys "$a")
+            printf '}'
+        done <<< "$apps"
+        printf '}}\n'
+        return 0
+    fi
+
+    printf 'env runtime — %s\n' "$WT_CURRENT_ROOT"
+    printf '  slug   %s\n' "${slug:-<none>}"
+    if [ -n "$ports" ]; then
+        printf '  ports  '
+        printf '%s\n' "$ports" | port_print_pairs | tr '\n' ' '
+        printf '\n'
+    fi
+    while IFS= read -r a; do
+        [ -n "$a" ] || continue
+        printf '  %s (%s)\n' "$a" "$(env_app_dir "$a")"
+        while IFS= read -r k; do
+            [ -n "$k" ] || continue
+            out="$(env_chain_get "$a" "$k" "$WT_CURRENT_ROOT" 2>/dev/null || true)"
+            if [ -n "$out" ]; then val="${out%%$'\t'*}"; src="${out#*$'\t'}"; else val=""; src="unset"; fi
+            printf '    %-18s %s  (%s)\n' "$k" "$val" "$src"
+        done < <(cfg_env_value_keys "$a")
+    done <<< "$apps"
+}
+
+cmd_env_get() {
+    cfg_env_present || die "no [env] section in $(config_file)"
+    local app="" key=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --app) [ $# -ge 2 ] || usage_error "env get: --app requires a value"; app="$2"; shift 2 ;;
+            -*)    usage_error "env get: unknown option '$1'" ;;
+            *)     [ -z "$key" ] || usage_error "env get: too many arguments"; key="$1"; shift ;;
+        esac
+    done
+    [ -n "$key" ] || usage_error "env get requires a KEY"
+    local apps
+    if [ -n "$app" ]; then env_assert_app "$app"; apps="$app"; else apps="$(cfg_env_apps)"; fi
+    local a out val found=0 found_val=""
+    while IFS= read -r a; do
+        [ -n "$a" ] || continue
+        out="$(env_chain_get "$a" "$key" "$WT_CURRENT_ROOT" 2>/dev/null || true)"
+        [ -n "$out" ] || continue
+        val="${out%%$'\t'*}"
+        if [ "$found" -eq 1 ] && [ -z "$app" ]; then
+            die "env get: key '$key' is ambiguous across apps (use --app)"
+        fi
+        found=1; found_val="$val"
+    done <<< "$apps"
+    [ "$found" -eq 1 ] || die "env get: key '$key' not found"
+    printf '%s\n' "$found_val"
+}
+
+cmd_env_copy() {
+    cfg_env_present || die "no [env] section in $(config_file)"
+    local from_main=false app="" force=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --from-main) from_main=true; shift ;;
+            --app)       [ $# -ge 2 ] || usage_error "env copy: --app requires a value"; app="$2"; shift 2 ;;
+            --force|-f)  force=true; shift ;;
+            -*)          usage_error "env copy: unknown option '$1'" ;;
+            *)           usage_error "env copy: unexpected argument '$1'" ;;
+        esac
+    done
+    [ "$from_main" = "true" ] || usage_error "env copy: only --from-main is supported"
+    [ "$WT_CURRENT_ROOT" != "$WT_MAIN" ] || die "env copy --from-main: already in the main worktree"
+    local apps
+    if [ -n "$app" ]; then env_assert_app "$app"; apps="$app"; else apps="$(cfg_env_apps)"; fi
+    local a dir rel src dst copied=0 skipped=0
+    while IFS= read -r a; do
+        [ -n "$a" ] || continue
+        dir="$(env_app_dir "$a")"
+        while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            src="$(env_join "$WT_MAIN" "$dir" "$rel")"
+            dst="$(env_join "$WT_CURRENT_ROOT" "$dir" "$rel")"
+            if [ ! -e "$src" ]; then note "env copy: missing in main (skipped): $rel"; continue; fi
+            if [ -e "$dst" ] && [ "$force" != "true" ]; then skipped=$((skipped + 1)); continue; fi
+            mkdir -p "$(dirname "$dst")" || { warn "env copy: cannot create $(dirname "$dst")"; continue; }
+            if cp -R "$src" "$dst" 2>/dev/null; then
+                copied=$((copied + 1)); info "copied $rel"
+            else
+                warn "env copy: failed to copy $rel"
+            fi
+        done < <(cfg_env_list "$a" copy_from_main)
+    done <<< "$apps"
+    info "env copy: copied $copied, skipped $skipped"
+}
+
+# ============================================================================
+# wt check — declarative health probes ([[check]] manifest)
+# ============================================================================
+
+# http_code_of URL TIMEOUT: 3-digit status, or 000 on connect failure.
+http_code_of() {
+    local code
+    code="$(curl -s -o /dev/null -m "$2" -w '%{http_code}' "$1" 2>/dev/null)" || true
+    [ -n "$code" ] || code="000"
+    printf '%s' "$code"
+}
+
+cmd_check() {
+    require_project
+    validate_config
+    local json=false timeout="${WT_CHECK_TIMEOUT:-3}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json)    json=true; shift ;;
+            --timeout) [ $# -ge 2 ] || usage_error "check: --timeout requires a value"; timeout="$2"; shift 2 ;;
+            -*)        usage_error "check: unknown option '$1'" ;;
+            *)         usage_error "check: unexpected argument '$1'" ;;
+        esac
+    done
+    local n
+    n="$(cfg_check_count)"
+    [ "${n:-0}" -gt 0 ] || die "no [[check]] probes declared in $(config_file)"
+
+    local slug ports
+    slug="$(env_current_slug)"
+    ports="$(env_current_ports)"
+
+    local i=0 allok=1 json_checks="" human_lines=""
+    while [ "$i" -lt "$n" ]; do
+        local name url expect file nonempty ok=0 value detail
+        name="$(cfg_check_field "$i" name)"
+        [ -n "$name" ] || name="check$i"
+        url="$(cfg_check_field "$i" url)"
+        expect="$(cfg_check_field "$i" expect)"
+        file="$(cfg_check_field "$i" file)"
+        nonempty="$(cfg_check_field "$i" nonempty)"
+        if [ -n "$url" ]; then
+            url="$(env_expand_str "$url" "$slug" "$ports" "" 0)"
+            value="$(http_code_of "$url" "$timeout")"
+            if [ -n "$expect" ]; then
+                [ "$value" = "$expect" ] && ok=1
+            else
+                [ "$value" != "000" ] && ok=1
+            fi
+            detail="$url (HTTP $value)"
+        elif [ -n "$file" ]; then
+            file="$(env_expand_str "$file" "$slug" "$ports" "" 0)"
+            case "$file" in /*) ;; *) file="$WT_CURRENT_ROOT/$file" ;; esac
+            if [ -f "$file" ]; then value="$(wc -c < "$file" 2>/dev/null | tr -d ' ')"; else value=0; fi
+            if [ "$nonempty" = "true" ]; then
+                [ "${value:-0}" -gt 0 ] 2>/dev/null && ok=1
+            else
+                [ -f "$file" ] && ok=1
+            fi
+            detail="$file (${value:-0} B)"
+        else
+            detail="(no url/file declared)"
+        fi
+        [ "$ok" -eq 1 ] || allok=0
+        [ "$i" -eq 0 ] || json_checks="$json_checks,"
+        json_checks="$json_checks{\"name\":$(json_escape "$name"),\"ok\":$(bool_json "$ok"),\"detail\":$(json_escape "$detail")}"
+        human_lines="$human_lines$(printf '  %-12s %-4s %s' "$name" "$(bool_json "$ok")" "$detail")
+"
+        i=$((i + 1))
+    done
+
+    if [ "$json" = "true" ]; then
+        printf '{"worktree":%s,"slug":%s,"ok":%s,"checks":[%s]}\n' \
+            "$(json_escape "$WT_CURRENT_ROOT")" "$(json_escape "$slug")" "$(bool_json "$allok")" "$json_checks"
+        [ "$allok" -eq 1 ] || exit 1
+        return 0
+    fi
+
+    printf 'checks — %s\n' "$WT_CURRENT_ROOT"
+    printf '%s' "$human_lines"
+    if [ "$allok" -eq 1 ]; then
+        printf '\nall healthy\n'
+        return 0
+    fi
+    printf '\nunhealthy — see the failing probes above\n'
+    exit 1
+}
+
+# ============================================================================
+# wt teardown — canonical teardown recipe (task/slot)
+#
+# Order (refactor-design.md §16 decision): stop processes (quiesce) -> archive
+# -> release ports -> clear the claim. Every step is best-effort and the
+# command always exits 0, so it is safe as a hook body.
+# ============================================================================
+
+cmd_teardown() {
+    require_project
+    validate_config
+    local json=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) json=true; shift ;;
+            -*)     usage_error "teardown: unknown option '$1'" ;;
+            *)      usage_error "teardown: unexpected argument '$1'" ;;
+        esac
+    done
+    local root="$WT_CURRENT_ROOT" slug="" rc=0
+    if task_claim_load "$root" 2>/dev/null; then
+        slug="$TASK_SLUG"
+    else
+        local br
+        br="$(current_branch)"
+        [ -n "$br" ] && slug="$(task_slug_from_branch "$br")"
+    fi
+
+    # 1. stop this worktree's processes (cwd-scoped, never by name)
+    local proc_out
+    proc_out="$(cmd_proc_stop --cwd "$root" --json 2>/dev/null || printf '{"stopped":[],"killed":[]}')"
+
+    # 2. archive the declared paths (best-effort)
+    local apaths archive_state="skip" p
+    apaths="$(cfg_task_archive_paths)"
+    if [ -n "$slug" ] && [ -n "${apaths//[[:space:]]/}" ]; then
+        local -a aargs=()
+        while IFS= read -r p; do
+            [ -n "$p" ] && aargs+=(--path "$p")
+        done <<< "$apaths"
+        cmd_archive --slug "$slug" "${aargs[@]}" >/dev/null 2>&1 || true
+        archive_state="ok"
+    fi
+
+    # 3. release this slug's port rows
+    local release_state="skip"
+    if [ -n "$slug" ]; then
+        cmd_port_release --slug "$slug" >/dev/null 2>&1 || true
+        release_state="ok"
+    fi
+
+    # 4. drop the identity claim
+    rm -f "$(task_claim_file "$root")" 2>/dev/null || true
+    rmdir "$root/.wt" 2>/dev/null || true
+
+    if [ "$json" = "true" ]; then
+        printf '{"slug":%s,"proc":%s,"archive":%s,"portRelease":%s,"claimClear":"ok"}\n' \
+            "$(json_escape "$slug")" "$proc_out" "$(json_escape "$archive_state")" "$(json_escape "$release_state")"
+        return 0
+    fi
+    info "teardown complete: slug=${slug:-<none>} (proc-stop ok, archive $archive_state, port-release $release_state, claim clear)"
     return 0
 }
 
@@ -2820,8 +3550,13 @@ model = ""
 push = false
 
 [hooks]
-# Optional script run after a worktree is created (relative to the main project root).
-# post_setup = "scripts/setup-worktree.sh"
+# Lifecycle hooks, relative to the main worktree root. `setup` runs after a
+# worktree is created; `teardown` runs before a worktree is removed. Both run
+# with the worktree as cwd and are given WT_MODE (slot|task), WT_HOOK
+# (setup|teardown), WT_SLOT, WT_BRANCH, WT_WORKTREE and WT_MAIN_WORKTREE.
+# "post_setup" is the legacy name for setup (still accepted).
+# setup    = "scripts/setup-worktree.sh"
+# teardown = "scripts/teardown-worktree.sh"
 
 [task]
 # Task-mode worktrees (ephemeral, one per task) use these settings.
@@ -2831,8 +3566,12 @@ branch_pattern = "${type}/${slug}"
 types = ["task"]
 # Fallback "lo-hi" TCP range for roles not listed in [task.port_ranges].
 # Omit to make undeclared roles unclaimable (roles can still be pinned via
-# `wt task register --port role=PORT`).
+# `wt claim register --port role=PORT`).
 # port_range_default = "10000-11000"
+# Roles every new claim must carry a port for (fail fast if unallocatable).
+# required_roles = ["gateway", "web"]
+# Paths snapshotted by `wt teardown` / `wt archive`.
+# archive_paths = ["apps/gateway/data", "logs"]
 
 #[task.port_ranges]
 # Role(app name) -> closed port range. The role set is project-defined and any
@@ -2844,6 +3583,31 @@ types = ["task"]
 # wt archive defaults.
 # archive_budget = 60
 # archive_max_bytes = 26214400
+
+# ---- optional env plane (wt env materialize|show|get|copy) -------------------
+# Declarative per-app env files. wt implements a file chain plus three
+# placeholder classes (${slug}, ${port.<role>}, ${env.<KEY>}); it never
+# implements project-specific dotenv semantics. Active only when [env] exists.
+#[env.gateway]
+# dir            = "apps/gateway"
+# files          = [".env", ".env.development", ".env.development.local"]
+# seed           = "scripts/seed/gateway.env"   # read from the main worktree
+# seed_target    = ".env.development"           # where the seed is written
+# gen            = ".env.development.local"     # where values are written
+# copy_from_main = [".env.development", ".env.development.local"]  # slot mode
+#[env.gateway.values]
+# PORT = "${port.gateway}"
+# CORS = "http://localhost:${port.web}"
+
+# ---- optional declarative health probes (wt check) --------------------------
+#[[check]]
+# name   = "api"
+# url    = "http://localhost:${port.gateway}/api/v1/models"
+# expect = 200
+#[[check]]
+# name     = "database"
+# file     = "apps/gateway/data/gateway.${slug}.sqlite"
+# nonempty = true
 EOF
     } > "$target"
 
@@ -2867,10 +3631,14 @@ main() {
         list)    cmd_list ;;
         status)  cmd_status ;;
         current) cmd_current "$@" ;;
+        claim)   cmd_claim "$@" ;;
         task)    cmd_task "$@" ;;
         port)    cmd_port "$@" ;;
         proc)    cmd_proc "$@" ;;
         archive) cmd_archive "$@" ;;
+        env)     cmd_env "$@" ;;
+        check)   cmd_check "$@" ;;
+        teardown) cmd_teardown "$@" ;;
         assert)  cmd_assert "$@" ;;
         init)    cmd_init "$@" ;;
         config)  cmd_config "$@" ;;
@@ -2885,21 +3653,29 @@ usage() {
     cat <<'EOF'
 usage: wt <command> [args...]
 
-Commands:
-  add <slot> [branch]     create a persistent worktree slot
-  remove <slot>           remove a worktree slot (safe by default)
+Workflow
+  add <slot> [branch]     create a persistent worktree slot (runs setup hook)
+  remove <slot>           remove a worktree slot (runs teardown hook)
   switch <branch>         switch or create a branch (new from main)
   commit [msg] [flags]    commit changes (agent-assisted, or explicit message)
   merge                   merge current branch into the main worktree
   sync                    merge all slot branches into main, then align all worktrees
-  list                    list all worktrees
-  status                  show current workspace status
-  current [--json]        machine-friendly current context
-  task register|read|clear|slug|branch   task-worktree identity claim
-  port claim|release|list  per-task port registry
-  proc stop               stop processes whose cwd is inside a dir
-  archive                 snapshot paths for a task
-  assert --mode M         assert the current worktree's mode (main|slot|task)
+  list | status | current [--json]
+
+Toolkit
+  claim register|read|clear        this worktree's identity claim
+  port claim|release|list          per-project port registry
+  proc stop --cwd DIR              stop processes whose cwd is inside DIR
+  archive --slug S --path P...     snapshot paths for a worktree
+  env materialize|show|get|copy    declarative env plane ([env] manifest)
+  check [--json]                   run declarative health probes ([[check]])
+  teardown [--json]                canonical teardown (stop/archive/release/clear)
+  assert --mode M                  assert the current worktree's mode
+
+Lifecycle helpers
+  task slug|branch                 branch<->slug helpers
+
+Setup
   init                    generate a default .wt.toml (in the main worktree)
   config get/set <key>    read/write .wt.toml
   doctor                  check prerequisites

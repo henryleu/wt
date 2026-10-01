@@ -49,7 +49,7 @@ task, and `orca worktree rm` removes it when the task is done. That is exactly
 Task mode detects a task worktree **solely** by the presence of
 `<worktree>/.wt/task.json`. A freshly created Orca worktree has no claim yet, so
 `wt` initially classifies it as `slot`; the setup hook's first job is to
-`wt task register` it, after which it is `task` for every later command.
+`wt claim register` it, after which it is `task` for every later command.
 
 ---
 
@@ -59,7 +59,7 @@ Task mode detects a task worktree **solely** by the presence of
 | --- | --- | --- |
 | Worktree create / remove | ✅ `orca worktree create` / `rm` | — |
 | When hooks run | ✅ setup after create, archive before remove | — |
-| Task identity claim | — | ✅ `wt task register/read/clear` (`.wt/task.json`) |
+| Task identity claim | — | ✅ `wt claim register/read/clear` (`.wt/task.json`) |
 | Port allocation per app role | — | ✅ `wt port claim/release/list` (`~/.wt/ports/<key>.tsv`) |
 | Process cleanup | — | ✅ `wt proc stop --cwd` (cwd-scoped, never by name) |
 | Evidence snapshot before removal | — | ✅ `wt archive` (`~/.wt/archive/<key>/<slug>/`) |
@@ -148,12 +148,16 @@ log = 20
 [task]
 # Task branch template. Must contain ${slug}; ${type} is optional.
 # Orca creates the branch, so this is only used by `wt task slug`/`wt task branch`
-# and by slug derivation inside `wt task register`.
+# and by slug derivation inside `wt claim register`.
 branch_pattern = "${type}/${slug}"
 # Allowed ${type} values (first is the default).
 types = ["task"]
 # Fallback range for roles not listed in [task.port_ranges].
 port_range_default = "10000-11999"
+# Every new claim must carry a port for these roles (fail fast if unallocatable).
+required_roles = ["gateway", "web"]
+# Default paths `wt teardown` / `wt archive` snapshot.
+archive_paths = ["logs", "coverage", ".playwright"]
 # Best-effort snapshot budget for `wt archive`.
 archive_budget = 90
 archive_max_bytes = 26214400
@@ -164,6 +168,23 @@ archive_max_bytes = 26214400
 gateway = "10000-10200"
 web     = "10201-10400"
 console = "10401-10600"
+
+[hooks]
+# `wt` runs these for *slot-mode* worktrees (`wt add` / `wt remove`); Orca drives
+# task-mode worktrees with `orca.yaml`, but the two paths share this contract.
+# setup    = "scripts/setup-worktree.sh"
+# teardown = "scripts/teardown-worktree.sh"
+
+# Optional: let `wt env materialize` generate per-task env files from the claim
+# ports and a seed in the main checkout (see refactor-design.md §5).
+# [env.gateway]
+# dir = "apps/gateway"
+# files = [".env", ".env.development.local"]
+# seed = "scripts/orca/seed/gateway.env"
+# seed_target = ".env.development"
+# gen = ".env.development.local"
+# [env.gateway.values]
+# PORT = "${port.gateway}"
 ```
 
 Notes:
@@ -184,7 +205,7 @@ Notes:
 ```
 
 If `.wt/` is not ignored, `wt commit`'s `git add -A` (and any agent `git add -A`)
-will stage `.wt/task.json`. `wt task register` prints a warning when it detects
+will stage `.wt/task.json`. `wt claim register` prints a warning when it detects
 this — fix it rather than ignoring the warning.
 
 ### 4.3 Step 4 — role/port ranges
@@ -297,7 +318,7 @@ branch="$(git branch --show-current)"
 slug="$("$WT" task slug --branch "$branch")"
 [ -n "$slug" ] || die "cannot derive a slug from branch '$branch'"
 
-claim="$("$WT" task register \
+claim="$("$WT" claim register \
   --slug  "$slug" \
   --type  task \
   --label "${ORCA_WORKSPACE_NAME:-$branch}")"
@@ -400,41 +421,43 @@ log() { printf '[teardown] %s\n' "$*" >&2; }
 worktree="${ORCA_WORKTREE_PATH:-$PWD}"
 cd "$worktree" 2>/dev/null || true
 
-# ---- 1. Read the claim so we act on exactly this task's identity ------------
-slug=""
-if claim="$("$WT" task read 2>/dev/null)"; then
-  slug="$(printf '%s\n' "$claim" | sed -n 's/^slug=//p')"
-fi
-log "slug=${slug:-<none>}"
-
-# ---- 2. Preserve evidence before anything is destroyed ----------------------
-if [ -n "$slug" ]; then
-  "$WT" archive --slug "$slug" \
-    --path scratch --path logs --path coverage --path .playwright || true
-fi
-
-# ---- 3. Free this task's port reservations (registry ledger) ----------------
-[ -n "$slug" ] && { "$WT" port release --slug "$slug" || true; }
-
-# ---- 4. Stop only this worktree's processes (matched by cwd, never by name) --
-"$WT" proc stop --cwd "$worktree" || true
-
-# ---- 5. Drop the identity claim (idempotent) --------------------------------
-"$WT" task clear || true
+# Canonical teardown: stop processes -> archive [task].archive_paths ->
+# release ports -> clear claim. Best-effort; always exits 0.
+"$WT" teardown || true
 
 log "teardown complete"
 exit 0
 ```
 
+If you need to interleave project-specific steps (or do not set
+`[task].archive_paths`), expand the sequence yourself:
+
+```bash
+slug="$("$WT" claim read 2>/dev/null | sed -n 's/^slug=//p')"
+"$WT" proc stop --cwd "$worktree" || true                       # stop writers
+[ -n "$slug" ] && "$WT" archive --slug "$slug" --path logs || true  # snapshot
+[ -n "$slug" ] && "$WT" port release --slug "$slug" || true     # free ports
+"$WT" claim clear || true                                        # drop identity
+```
+
 ### 6.1 Ordering rationale
 
-1. **Read first** — `wt task read` yields the slug used by every later step.
-2. **Archive first** — snapshot evidence *before* ports/processes/claims vanish.
-3. **Release ports** — the registry is a reservation ledger; free the rows so
+The canonical order is **stop processes → archive → release ports → clear claim**,
+which is exactly what `wt teardown` runs (so the hook body is usually one line):
+
+```bash
+"$WT" teardown || true
+```
+
+Expand it by hand only when you must interleave project-specific steps:
+
+1. **Read first** — `wt claim read` yields the slug used by every later step.
+2. **Stop processes** — `wt proc stop` matches by **cwd only** (never by name)
+   and excludes its own shell and the `wt` process. Quiescing first means the
+   snapshot below sees a consistent, flushed state.
+3. **Archive** — snapshot evidence after the writers have stopped.
+4. **Release ports** — the registry is a reservation ledger; free the rows so
    later tasks can reuse the numbers.
-4. **Stop processes** — `wt proc stop` matches by **cwd only** (it never matches
-   by process name) and excludes its own shell and the `wt` process. This is the
-   step most likely to disturb the caller, so it comes after the state work.
 5. **Clear the claim** — last; it is idempotent and safe to repeat.
 
 ### 6.2 What teardown does *not* do
@@ -471,7 +494,7 @@ as `ORCA_ROOT_PATH`; they exist for import compatibility and are safe to ignore.
 processes, read the claim explicitly:
 
 ```bash
-eval "$(wt task read | sed 's/^\([a-z][a-z0-9_]*\)=/WT_CLAIM_\1=/')"
+eval "$(wt claim read | sed 's/^\([a-z][a-z0-9_]*\)=/WT_CLAIM_\1=/')"
 ```
 
 or, more simply, export the ports you generated into your env file in the setup
@@ -543,7 +566,7 @@ wt port list                  # every (slug, role, port) reservation
 > **Integrate before removing (team workflow).** `wt merge` folds a task branch
 > into the local main worktree and pushes it. For a shared monorepo you may
 > prefer a normal branch push + PR review; either way, run
-> `wt port release` / `wt archive` / `wt task clear` through the teardown hook so
+> `wt port release` / `wt archive` / `wt claim clear` through the teardown hook so
 > reservations do not leak.
 
 ---
@@ -629,11 +652,11 @@ task's logs and scratch output before removal.
 
 ### 10.1 Setup
 
-- **Idempotent by design.** `wt task register` reprints an existing valid claim
+- **Idempotent by design.** `wt claim register` reprints an existing valid claim
   and does not reallocate ports. Safe to re-run after a partial failure.
 - **Corrupt claim is fatal, never silently overwritten.** If `.wt/task.json` is
-  unreadable or `version != 1`, `wt task register` exits `1` and tells you to run
-  `wt task clear`. Fix or clear it deliberately.
+  unreadable or `version != 1`, `wt claim register` exits `1` and tells you to run
+  `wt claim clear`. Fix or clear it deliberately.
 - **A failing setup hook leaves the worktree in place** for debugging. Orca
   reports the failure; under `wait-for-setup` the agent does not start.
 - **Never run setup in the primary checkout.** Both the `ORCA_ROOT_PATH` check
@@ -663,7 +686,7 @@ task's logs and scratch output before removal.
 
 ```text
 0 success · 1 operational failure · 2 usage error
-3 assertion mismatch (wt assert) · 4 expected state missing/corrupt (wt task read)
+3 assertion mismatch (wt assert) · 4 expected state missing/corrupt (wt claim read)
 ```
 
 ---
@@ -674,15 +697,15 @@ task's logs and scratch output before removal.
 | --- | --- | --- |
 | Hook fails with `wt: command not found` or `yq: command not found` | GUI-launched Orca has a minimal `PATH` | Prepend Homebrew / `~/.local/bin` / `~/.bun/bin` to `PATH` in the hook, or set `WT_BIN` to an absolute path. §3.1 |
 | `wt assert --mode task` exits 3 at the top of setup | A fresh worktree has no claim yet, so it is `slot` mode | Register first, then `wt assert --mode task`. §5 |
-| `wt task register` dies with `cannot resolve ${type}` | Orca's branch name lacks the configured `${type}/` prefix | Pass `--type task` explicitly (as the hook does). Or adjust `[task].branch_pattern`. |
-| `wt current` / `wt task register` fails: no project | `.wt.toml` is not in the primary checkout on the base branch | Commit `.wt.toml` to `origin/main` (the base ref Orca uses). §4.1 |
+| `wt claim register` dies with `cannot resolve ${type}` | Orca's branch name lacks the configured `${type}/` prefix | Pass `--type task` explicitly (as the hook does). Or adjust `[task].branch_pattern`. |
+| `wt current` / `wt claim register` fails: no project | `.wt.toml` is not in the primary checkout on the base branch | Commit `.wt.toml` to `origin/main` (the base ref Orca uses). §4.1 |
 | `.wt/task.json` shows up in `git status` | `.wt/` is not gitignored | Add `.wt/` to `.gitignore` and commit it. §4.2 |
 | Setup succeeds in a terminal but not in Orca | Local Repository Hook is shadowing the shared `orca.yaml` script, or trust is pending | Check Repository Hooks: clear/disable the local script, or set the source policy to run both; approve the shared-script trust prompt. §4.4 |
 | Agent starts before setup finishes | Startup policy not `wait-for-setup` | Set `setupAgentStartupPolicy: wait-for-setup` in `orca.yaml`. |
 | `orca worktree rm` removed the worktree without cleaning up | Archive hooks are skipped unless `--run-hooks` is passed | Use `orca worktree rm --run-hooks`. §8 |
 | `orca worktree rm --run-hooks` refuses to remove | Archive hook exited non-zero | Fix the hook to exit 0; only use `--allow-failed-archive-hook` when you accept skipping cleanup. §10.2 |
 | `no free port for role 'web' in range ...` | Role range exhausted by leaked or long-lived reservations | Free stale rows: `wt port list`, then `wt port release --slug <slug>`; widen the range if you truly run that many tasks. |
-| `wt task register: corrupt claim` | `.wt/task.json` was hand-edited or truncated | `wt task clear` (or fix the file), then re-run setup. |
+| `wt claim register: corrupt claim` | `.wt/task.json` was hand-edited or truncated | `wt claim clear` (or fix the file), then re-run setup. |
 | Ports/archives appear "lost" | `merge.remote` URL changed, so `project_key` changed | `wt doctor` prints the key; migrate manually: `mv ~/.wt/ports/<old>.tsv ~/.wt/ports/<new>.tsv` (same for `archive/`). |
 | Leftover processes bind a released port | A process `cd`'d outside the worktree and was missed by `wt proc stop` | This is by design; find it with `lsof -i :<port>` and stop it explicitly. |
 
@@ -695,9 +718,9 @@ task's logs and scratch output before removal.
 | Command | Purpose |
 | --- | --- |
 | `wt current [--json]` | Mode + slug + `port.<role>`; data on stdout. |
-| `wt task register [--slug S] [--branch B] [--type T] [--port R=P]… [--label L]` | Claim identity; allocate declared roles. Idempotent. |
-| `wt task read [--json]` | Print the claim (exit 4 if missing/corrupt). |
-| `wt task clear` | Remove the claim (idempotent; leaves the registry alone). |
+| `wt claim register [--slug S] [--branch B] [--type T] [--port R=P]… [--label L]` | Claim identity; allocate declared roles. Idempotent. |
+| `wt claim read [--json]` | Print the claim (exit 4 if missing/corrupt). |
+| `wt claim clear` | Remove the claim (idempotent; leaves the registry alone). |
 | `wt task slug [--branch B]` | Derive a slug from a branch (pure). |
 | `wt task branch <slug> [--type T]` | Expand `[task].branch_pattern` (pure). |
 | `wt port claim [--slug S] [--role NAME]…` | Allocate the lowest free port per role. |
@@ -705,6 +728,10 @@ task's logs and scratch output before removal.
 | `wt port list [--slug S] [--json]` | List reservations. |
 | `wt proc stop --cwd DIR [--json]` | TERM→KILL processes whose cwd is inside `DIR`. Always exit 0. |
 | `wt archive --slug S --path P… [--budget SEC] [--max-bytes N]` | Best-effort snapshot. Always exit 0. |
+| `wt env materialize [--app NAME] [--force]` | Render seed + `${slug}`/`${port.<role>}`/`${env.<KEY>}` from the `[env]` manifest. |
+| `wt env show [--json]` / `wt env get <KEY>` | Resolve the effective env (last file wins) / one key. |
+| `wt check [--json]` | Run the `[[check]]` health probes; exit 1 when any fails. |
+| `wt teardown [--json]` | Canonical teardown: stop → archive → release ports → clear claim. Always exit 0. |
 | `wt assert --mode main\|slot\|task` | Mode guard; exit 3 on mismatch. |
 | `wt commit` / `wt merge` | Integrate the task branch. |
 | `wt doctor` | Diagnose prerequisites; print `project_key`. |
@@ -729,14 +756,16 @@ acme/                                  # primary checkout (ORCA_ROOT_PATH)
 ### 12.3 The five-line mental model
 
 1. Orca creates and removes the worktree.
-2. Setup registers identity: `wt task register`.
-3. Your project installs, generates env, migrates — then exits.
+2. Setup registers identity: `wt claim register` (and `wt env materialize` when an `[env]` manifest exists).
+3. Your project installs, generates remaining config, migrates — then exits.
 4. The agent works and integrates with `wt merge`.
-5. Teardown releases what the task held: `wt proc stop` → `wt port release` →
-   `wt archive` → `wt task clear`, always exiting 0.
+5. Teardown releases what the task held: `wt teardown` (stop → archive →
+   release ports → clear claim), always exiting 0.
 
 ---
 
 *For the full `wt` specification see [`design.md`](design.md); for the end-user
 manual (including slot mode) see [`wt_manual.md`](wt_manual.md); for task-mode
-design decisions see `design.md` §40 and [`caveats.md`](caveats.md) §3.*
+design decisions see `design.md` §40 and [`caveats.md`](caveats.md) §3. For the
+unified lifecycle/toolkit refactor (symmetric hooks, `wt claim`, the env plane,
+`wt check`, `wt teardown`) see [`refactor-design.md`](refactor-design.md).*

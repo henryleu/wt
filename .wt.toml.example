@@ -45,8 +45,54 @@ model = ""
 push = false
 
 [hooks]
-# Optional script run after a worktree is created. Path is relative to the
-# main project root. The script runs with the new worktree as its working dir
-# and receives WT_MAIN_WORKTREE, WT_WORKTREE, WT_SLOT, WT_BRANCH,
-# WT_PROJECT_NAME environment variables.
-# post_setup = "scripts/setup-worktree.sh"
+# Lifecycle hooks. Paths are relative to the main project root. Both run with
+# the worktree as cwd and receive WT_MAIN_WORKTREE, WT_WORKTREE, WT_SLOT,
+# WT_BRANCH, WT_PROJECT_NAME, WT_MODE (slot|task) and WT_HOOK (setup|teardown).
+# `setup` runs after a worktree is created; `teardown` runs before it is
+# removed. hooks.post_setup is the legacy name for `setup`.
+# setup    = "scripts/setup-worktree.sh"
+# teardown = "scripts/teardown-worktree.sh"
+
+[task]
+# Task-mode worktrees (ephemeral, one per task) use these settings.
+# Branch template. Must contain ${slug}; ${type} is optional.
+branch_pattern = "${type}/${slug}"
+# Allowed ${type} values (first is the default).
+types = ["task"]
+# Fallback "lo-hi" TCP range for roles not listed in [task.port_ranges];
+# omitted roles otherwise fall back to it, or are unclaimable if it is absent.
+# port_range_default = "10000-11000"
+# Roles every new claim must carry a port for.
+# required_roles = ["gateway", "web"]
+# Paths snapshotted by `wt teardown` / `wt archive`.
+# archive_paths = ["apps/gateway/data", "logs"]
+# archive_budget = 60
+# archive_max_bytes = 26214400
+
+#[task.port_ranges]
+# Role(app name) -> closed "lo-hi" TCP range. Any number of roles.
+# gateway = "10000-10200"
+# web = "10201-10400"
+
+# Optional declarative env plane (`wt env materialize|show|get|copy`). wt
+# implements a file chain plus three placeholder classes (${slug},
+# ${port.<role>}, ${env.<KEY>}) and never project-specific dotenv semantics.
+#[env.gateway]
+# dir          = "apps/gateway"
+# files        = [".env", ".env.development", ".env.development.local"]
+# seed         = "scripts/seed/gateway.env"   # read from the main worktree
+# seed_target  = ".env.development"           # where the seed is written
+# gen          = ".env.development.local"     # where values are written
+# copy_from_main = [".env.development", ".env.development.local"]
+#[env.gateway.values]
+# PORT = "${port.gateway}"
+
+# Optional declarative health probes (`wt check`).
+#[[check]]
+# name   = "api"
+# url    = "http://localhost:${port.gateway}/api/v1/models"
+# expect = 200
+#[[check]]
+# name     = "database"
+# file     = "apps/gateway/data/gateway.${slug}.sqlite"
+# nonempty = true

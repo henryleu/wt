@@ -288,13 +288,19 @@ wt help
 wt version
 ```
 
-v2.1 adds the **Task Workspace Mode** toolkit (see §40):
+v2.1 adds the **Task Workspace Mode** toolkit (see §40). v2.2 unifies the two
+topologies around one setup/teardown lifecycle and renames the identity claim
+out of the `task` brand (see `refactor-design.md`):
 
 ```text
-wt task register|read|clear|slug|branch
+wt claim register|read|clear        # identity claim (was wt task register|read|clear)
 wt port claim|release|list
 wt proc stop
 wt archive
+wt env materialize|show|get|copy
+wt check
+wt teardown
+wt task slug|branch                 # lifecycle-specific helpers
 wt assert
 ```
 
@@ -386,8 +392,13 @@ Example:
 
 ```toml
 [hooks]
-post_setup = "scripts/setup-worktree.sh"
+setup = "scripts/setup-worktree.sh"
+# teardown = "scripts/teardown-worktree.sh"
 ```
+
+`hooks.setup` is the current name; `hooks.post_setup` is the legacy name
+(still accepted for one release). `hooks.teardown` (see §7) is its symmetric
+counterpart for `wt remove`.
 
 The hook must execute with:
 
@@ -403,6 +414,8 @@ WT_WORKTREE
 WT_SLOT
 WT_BRANCH
 WT_PROJECT_NAME
+WT_MODE      # slot | task
+WT_HOOK      # setup | teardown
 ```
 
 Exact variable names should be documented and tested.
@@ -438,6 +451,17 @@ git worktree remove <path>
 ```
 
 Do not use raw `rm -rf` as the primary removal mechanism.
+
+## Teardown hook
+
+Before removing the worktree, run `hooks.teardown` (see §6) with the worktree
+as the working directory, so the project can stop processes and release
+resources while the directory is still present. Teardown is best-effort: a
+failing hook is a warning and removal still proceeds.
+
+If the worktree directory is already gone (accidental `rm -rf`), teardown still
+runs (from the main worktree, with `WT_WORKTREE` pointing at the missing path),
+and the stale Git administrative entry is pruned so the slot can be rebuilt.
 
 ## Safety
 
@@ -914,6 +938,8 @@ push = true
 branch_pattern = "${type}/${slug}"      # must contain ${slug}; ${type} optional
 types = ["task"]                        # allowed ${type} values (first = default)
 port_range_default = "10000-11000"      # fallback range for undeclared app roles
+required_roles = ["gateway", "web"]     # every new claim must carry a port for these
+archive_paths = ["logs", "data"]        # paths snapshotted by wt teardown/wt archive
 archive_budget = 60                     # wt archive default time budget (seconds)
 archive_max_bytes = 26214400            # wt archive per-file size cap (bytes)
 
@@ -922,7 +948,25 @@ gateway = "10000-10200"                 # the role set is open and project-defin
 web = "10201-10400"
 
 [hooks]
-post_setup = "scripts/setup-worktree.sh"
+setup = "scripts/setup-worktree.sh"       # runs after a worktree is created
+# teardown = "scripts/teardown-worktree.sh" # runs before a worktree is removed
+
+# Optional env plane (v2.2; see §40.4) — active only when [env] exists.
+[env.gateway]
+dir = "apps/gateway"
+files = [".env", ".env.development", ".env.development.local"]
+seed = "scripts/seed/gateway.env"
+seed_target = ".env.development"
+gen = ".env.development.local"
+copy_from_main = [".env.development", ".env.development.local"]
+[env.gateway.values]
+PORT = "${port.gateway}"
+
+# Optional declarative health probes (v2.2; see §40.5).
+[[check]]
+name = "api"
+url = "http://localhost:${port.gateway}/api/v1/models"
+expect = 200
 ```
 
 ## 15.1 Meaning
@@ -1012,11 +1056,15 @@ Default:
 true
 ```
 
-### `hooks.post_setup`
+### `hooks.setup` / `hooks.teardown`
 
-Optional script run after a new worktree is created.
+Optional scripts run around the worktree lifecycle. `setup` runs after a new
+worktree is created (`wt add`); `teardown` runs before a worktree is removed
+(`wt remove`). `hooks.post_setup` is the legacy name for `setup` and is still
+accepted. Paths are relative to the **main project root**.
 
-The path is relative to the **main project root**.
+Both receive `WT_MAIN_WORKTREE`, `WT_WORKTREE`, `WT_SLOT`, `WT_BRANCH`,
+`WT_PROJECT_NAME`, `WT_MODE` (`slot`|`task`) and `WT_HOOK` (`setup`|`teardown`).
 
 ## 15.2 `[task]` section (v2.1)
 
@@ -1115,13 +1163,18 @@ branch.pattern = workspace/${slot}
 merge.strategy = no-ff
 merge.remote = origin
 merge.push = true
-hooks.post_setup = absent
+hooks.setup = absent            (hooks.post_setup is the legacy name)
+hooks.teardown = absent
 task.branch_pattern = ${type}/${slug}
 task.types = [task]
 task.port_range_default = absent (undeclared roles cannot claim)
 task.port_ranges = {} (open role set)
+task.required_roles = []
+task.archive_paths = []
 task.archive_budget = 60
 task.archive_max_bytes = 26214400
+[env] = absent (optional env plane)
+[[check]] = absent (optional probes)
 ```
 
 The implementation should either provide these defaults centrally or write them to a generated config only when explicitly requested. Do not mutate `.wt.toml` merely because a default is being used.
@@ -1754,11 +1807,13 @@ Running `wt add a` again must fail without damaging the existing worktree.
 
 ### B5. Hook success
 
-Configure `post_setup` and verify it executes inside the new worktree.
+Configure `hooks.setup` and verify it executes inside the new worktree; verify
+`hooks.teardown` executes before removal (the directory still exists when it
+runs).
 
 ### B6. Hook failure
 
-Configure a failing hook.
+Configure a failing `setup` hook.
 
 Verify:
 
@@ -2162,7 +2217,7 @@ current_branch
 is_clean
 resolve_slot_path
 expand_pattern
-run_post_setup_hook
+run_setup_hook
 merge_current_branch
 ```
 
@@ -2349,7 +2404,7 @@ Possible later features, only after the core tool is stable:
 - `wt prune` for stale Git worktree metadata.
 - `wt doctor --fix` for safe repairs.
 - structured `--json` output for agent tooling *beyond* the v2.1 subset
-  (`wt current --json`, `wt port list --json`, `wt task read --json`).
+  (`wt current --json`, `wt port list --json`, `wt claim read --json`).
 - shell completion.
 - configurable policies for remote synchronization.
 - richer workspace metadata (v2.1 added a `mode` to `wt current`/`wt list`).
@@ -2390,7 +2445,7 @@ If an implementation detail conflicts with these principles, choose the safer an
 
 ---
 
-# 40. Task Workspace Mode (v2.1)
+# 40. Task Workspace Mode (v2.1; unified lifecycle in v2.2)
 
 `wt` understands two worktree topologies:
 
@@ -2430,8 +2485,8 @@ created for them.
 **Claim schema (v1).** `{"version":1,<?>}`; required `slug`, `branch`,
 `created_at`; optional `type`, `label`; `ports` is an arbitrary `role → port`
 object (may be `{}`). Readers reject a missing/corrupt/incompatible claim with
-exit 4; `task register` refuses to overwrite a corrupt claim (exit 1) and points
-at `wt task clear`. Writes are atomic (tmp file + same-filesystem `rename`).
+exit 4; `claim register` refuses to overwrite a corrupt claim (exit 1) and points
+at `wt claim clear`. Writes are atomic (tmp file + same-filesystem `rename`).
 Port keys are role names (`^[a-z][a-z0-9_-]*$`); KEY=VALUE output always prefixes
 port lines with `port.` (`port.console=5401`) so consumers use one parse rule.
 
@@ -2456,13 +2511,13 @@ classification.
 
 ## 40.4 Commands
 
-- `wt task register [--slug S] [--branch B] [--type T] [--port ROLE=PORT]… [--label L]`
+- `wt claim register [--slug S] [--branch B] [--type T] [--port ROLE=PORT]… [--label L]`
   — derive `slug`/`type` from the branch (or take them explicitly), allocate any
   unpinned declared roles from the registry, and write the claim. Idempotent:
   a valid existing claim with no `--port` is reprinted; with `--port` the given
   roles are updated in place (import mode). stdout = the claim as KEY=VALUE.
-- `wt task read [--json]` — print the claim; exit 4 when missing/corrupt/version≠1.
-- `wt task clear` — remove the claim (idempotent; never touches the registry).
+- `wt claim read [--json]` — print the claim; exit 4 when missing/corrupt/version≠1.
+- `wt claim clear` — remove the claim (idempotent; never touches the registry).
 - `wt task slug [--branch B]` / `wt task branch <slug> [--type T]` — pure
   branch↔slug helpers (no side effects).
 - `wt port claim|release|list` — the per-project port registry. `claim` picks
@@ -2474,6 +2529,13 @@ classification.
 - `wt archive --slug S --path P… [--budget SEC] [--max-bytes N]` — best-effort
   snapshot into `~/.wt/archive/<project_key>/<slug>/`, honoring size and time
   budgets; never fails the caller.
+- `wt env materialize|show|get|copy` — the optional declarative env plane (§40.7),
+  active only when `.wt.toml` has an `[env]` section.
+- `wt check [--json]` — run the declarative `[[check]]` probes (url/expect,
+  file/nonempty); exit 1 when any fails.
+- `wt teardown [--json]` — the canonical teardown recipe in order: stop
+  processes → archive `[task].archive_paths` → release ports → clear the claim.
+  Best-effort; always exit 0.
 - `wt assert --mode main|slot|task` — classify the current worktree; exit 3 on
   mismatch. Callers decide their own force-bypass policy.
 
@@ -2496,6 +2558,64 @@ classification.
 - `wt doctor` also checks that the state dir is writable and prints the
   project key / registry path.
 
+## 40.7 Unified lifecycle, env plane, and checks (v2.2)
+
+The v2.2 refactor (`refactor-design.md`) collapses the two topologies onto one
+model: **every worktree has a `setup` phase and a `teardown` phase**, triggered
+by `wt add`/`wt remove` for slots and by the orchestrator for tasks. Changes:
+
+- **Symmetric hooks.** `hooks.setup` (legacy name `hooks.post_setup`) and
+  `hooks.teardown`; both export `WT_MODE` and `WT_HOOK`. `wt remove` runs
+  teardown before removal and tolerates an already-deleted directory (pruning
+  stale metadata).
+- **Identity rename.** `wt task register|read|clear` → `wt claim register|read|clear`
+  (a claim is neutral; a slot may declare one too). `wt task slug|branch` stay.
+- **Env plane.** An optional `[env.<app>]` manifest with `dir`, `files`, `seed`,
+  `seed_target`, `gen`, `copy_from_main`, and a `[env.<app>.values]` map. `wt env
+  materialize` writes seed + generated values; `show`/`get` resolve the `files`
+  chain (last file wins); `copy --from-main` is the slot path. Placeholders are
+  exactly `${slug}`, `${port.<role>}`, `${env.<KEY>}` — no template engine.
+- **Declarative checks.** `[[check]]` probes (`name` + `url`[+`expect`] or
+  `file`[+`nonempty`]) run by `wt check`.
+- **Canonical teardown.** `wt teardown` implements the fixed order
+  stop → archive → release → clear.
+- **`[task]` additions.** `required_roles` (every new claim must carry a port
+  for these) and `archive_paths` (default snapshot paths).
+
+### Env plane semantics
+
+- **`.wt.toml` manifest:**
+
+  ```toml
+  [env.gateway]
+  dir = "apps/gateway"
+  files = [".env", ".env.development", ".env.development.local"]
+  seed = "scripts/seed/gateway.env"
+  seed_target = ".env.development"
+  gen = ".env.development.local"
+  copy_from_main = [".env.development", ".env.development.local"]
+  [env.gateway.values]
+  PORT = "${port.gateway}"
+  DB = "data/g.${slug}.sqlite"
+  ```
+
+  All paths are relative to `dir` except `seed`, which is read from the **main
+  worktree**. `materialize` never clobbers an existing file unless `--force`.
+- **Placeholders:** `${slug}` (claim/derived), `${port.<role>}` (claim port),
+  `${env.<KEY>}` (another declared value in the same app).
+
+### `wt teardown` order
+
+```text
+proc stop --cwd <worktree>            # quiesce
+archive --slug <slug> --path <archive_paths>   # snapshot
+port release --slug <slug>            # free ports
+claim clear                           # drop identity
+```
+
+Every step is best-effort; the command always exits 0, so it is safe as a hook
+body. `[task].archive_paths` supplies the archive list.
+
 ---
 
 # Appendix A — Reference `.wt.toml`
@@ -2516,7 +2636,11 @@ remote = "origin"
 push = true
 
 [hooks]
-post_setup = "scripts/setup-worktree.sh"
+setup = "scripts/setup-worktree.sh"
+# teardown = "scripts/teardown-worktree.sh"
+
+task.branch_pattern = "${type}/${slug}"
+task.types = ["task"]
 ```
 
 # Appendix B — Reference Directory Layout

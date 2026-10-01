@@ -11,7 +11,7 @@ documentation (see also [`design.md`](design.md) §25 and
 ## 1. Monorepo `node_modules`: symlinking vs. package-manager caching
 
 **The question.** Every agent worktree is a fresh checkout with no
-`node_modules`. Should a `post_setup` hook symlink the main worktree's
+`node_modules`. Should a `setup` hook symlink the main worktree's
 `node_modules` into each new worktree (the pattern sketched in `design.md` §25),
 or should each worktree install its own dependencies and rely on the package
 manager's cache?
@@ -60,7 +60,7 @@ mechanism. It breaks the isolation that worktrees exist to provide:
    then treat the shared `node_modules` as **read-only by policy**: no agent
    may modify dependencies; a dedicated slot/manual step owns dep changes, and
    a fresh install (not incremental) is performed after any change.
-3. If you do use a `post_setup` hook, prefer it for a per-slot
+3. If you do use a `setup` hook, prefer it for a per-slot
    `bun install`/`pnpm install` (or workspace-aware setup) rather than
    symlinking — it gives the same "slot is ready before the agent starts"
    benefit without the shared-state hazard.
@@ -76,8 +76,9 @@ mechanism. It breaks the isolation that worktrees exist to provide:
 - **Native modules** (`.node` binaries, platform-specific builds) may not
   hard-link/cache cleanly across worktrees and may need a rebuild per slot.
 - `node_modules` is (and should remain) **gitignored**; it is never part of
-  `wt`'s model. `wt` only provides the lifecycle point (`post_setup`) and the
-  `WT_*` environment variables — the dependency policy is the project's.
+  `wt`'s model. `wt` only provides the lifecycle points (`hooks.setup` /
+  `hooks.teardown`) and the `WT_*` environment variables — the dependency
+  policy is the project's.
 
 ---
 
@@ -100,13 +101,13 @@ mechanism. It breaks the isolation that worktrees exist to provide:
 
 ## 3. Task mode (v2.1) caveats
 
-Task Workspace Mode (`wt task` / `wt port` / `wt proc` / `wt archive` /
-`wt assert`) is a toolkit for orchestrator-driven ephemeral worktrees. See
-`design.md` §40 for the model.
+Task Workspace Mode (`wt claim` / `wt port` / `wt proc` / `wt archive` /
+`wt env` / `wt check` / `wt teardown` / `wt assert`) is a toolkit for
+orchestrator-driven ephemeral worktrees. See `design.md` §40 for the model.
 
 - **`.wt/` must be gitignored in task worktrees.** The identity claim lives at
   `<root>/.wt/task.json`. If `.wt/` is not ignored, `wt commit`'s `git add -A`
-  will stage the claim. `wt task register` prints a warning when
+  will stage the claim. `wt claim register` prints a warning when
   `git check-ignore -q .wt/task.json` fails — add `.wt/` to `.gitignore`.
 - **`project_key` drifts with the remote URL.** The port registry and archive
   are keyed by a hash of the configured `merge.remote` URL. Changing that URL

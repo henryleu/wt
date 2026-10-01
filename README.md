@@ -32,8 +32,9 @@ caller's current working directory** and without leaving Pi/Claude Code.
   reused across tasks.
 - **Task mode** (v2.1): one ephemeral worktree per task, created and destroyed
   by an external orchestrator. `wt` stays a *toolkit* — it never owns the task
-  lifecycle, but exposes primitives (`wt task`, `wt port`, `wt proc`,
-  `wt archive`, `wt assert`) that any project's setup/teardown hooks can compose.
+  lifecycle, but exposes primitives (`wt claim`, `wt port`, `wt proc`,
+  `wt archive`, `wt env`, `wt check`, `wt teardown`, `wt assert`) that any
+  project's setup/teardown hooks can compose.
   See [`design.md` §40](design.md) and [`wt_manual.md`](wt_manual.md).
 
 ## Requirements
@@ -88,10 +89,14 @@ wt remove a             # remove a slot (branch retained)
 | `wt merge` | Merge the current worktree's branch into the main worktree, optionally push. Requires a clean source and clean main. Aborts cleanly on conflict. |
 | `wt sync` | Batch: merge **every** slot's branch into main, push, then fast-forward every worktree (main + all slots) to the same commit. Runnable from any worktree (a slot *or* main). Dry-run checks all merges first and aborts atomically on any conflict. |
 | `wt commit [msg]` | Commit the current changes. With a message it stages everything and commits directly; without one, a coding agent (pi/claude) analyzes the changes and drives a Conventional Commit. `--dry-run`/`--push`/`--staged`/`--agent`/`--model` available. |
-| `wt task register\|read\|clear\|slug\|branch` | Task-mode identity claim in `<root>/.wt/task.json` (allocate ports, print/clear the claim, derive branch↔slug). Toolkit — the orchestrator owns task lifecycle. |
+| `wt claim register\|read\|clear` | This worktree's identity claim in `<root>/.wt/task.json` (register allocates ports; read/clear inspect or drop it). Toolkit — the orchestrator owns task lifecycle. |
+| `wt task slug\|branch` | Pure branch↔slug helpers for the `[task].branch_pattern`. |
 | `wt port claim\|release\|list` | Per-project port registry (`~/.wt/ports/<key>.tsv`): allocate the lowest free port per app role, release, or list (TSV / `--json`). |
 | `wt proc stop --cwd DIR` | Signal processes whose **cwd** is inside DIR (TERM→KILL); never matches by name. Best-effort. |
 | `wt archive --slug S --path P…` | Best-effort snapshot of paths into `~/.wt/archive/<key>/<slug>/` with size/time budgets. |
+| `wt env materialize\|show\|get\|copy` | Declarative env plane (`[env]` manifest): render seed + `${slug}`/`${port.<role>}`/`${env.<KEY>}` values, resolve the effective chain, read one key, or copy env from main into a slot. |
+| `wt check [--json]` | Run the declarative `[[check]]` health probes; exit 1 when any fails. |
+| `wt teardown [--json]` | Canonical teardown for a worktree: stop processes → archive → release ports → clear claim (best-effort; always exits 0). |
 | `wt assert --mode main\|slot\|task` | Assert the current worktree's mode (exit 3 on mismatch) so hooks can guard where they run. |
 | `wt switch <branch>` | Switch this worktree's branch; creates new branches from the configured main branch. Refuses to switch a *linked* worktree to the main branch. |
 | `wt list` | Show all worktrees (main + linked) with branch and clean/dirty state. |
@@ -139,6 +144,8 @@ push = false                            # push current branch after a successful
 branch_pattern = "${type}/${slug}"      # task branch template (must contain ${slug})
 types = ["task"]                        # allowed ${type} values (first = default)
 port_range_default = "10000-11000"      # fallback range for undeclared app roles (optional)
+required_roles = ["gateway", "web"]     # every new claim must carry a port for these
+archive_paths = ["logs", "data"]        # paths snapshotted by `wt teardown`/`wt archive`
 archive_budget = 60                     # `wt archive` default time budget (seconds)
 archive_max_bytes = 26214400            # `wt archive` per-file size cap (bytes)
 
@@ -147,7 +154,25 @@ gateway = "10000-10200"
 web = "10201-10400"
 
 [hooks]
-post_setup = "scripts/setup-worktree.sh"  # optional; runs in the new worktree
+setup = "scripts/setup-worktree.sh"       # optional; runs after a worktree is created
+# teardown = "scripts/teardown-worktree.sh" # optional; runs before it is removed
+# (hooks.post_setup is the legacy name for `setup`)
+
+[env.gateway]                           # optional declarative env plane (`wt env`)
+dir = "apps/gateway"
+files = [".env", ".env.development", ".env.development.local"]
+seed = "scripts/seed/gateway.env"       # read from the main worktree
+seed_target = ".env.development"        # where the seed is written
+gen = ".env.development.local"          # where values are written
+copy_from_main = [".env.development", ".env.development.local"]
+[env.gateway.values]
+PORT = "${port.gateway}"
+CORS_ORIGINS = "http://localhost:${port.web}"
+
+[[check]]                               # optional declarative health probes (`wt check`)
+name = "api"
+url = "http://localhost:${port.gateway}/api/v1/models"
+expect = 200
 ```
 
 Defaults: `main_branch=develop`, `worktree.base=../worktrees`,
@@ -160,15 +185,20 @@ Defaults: `main_branch=develop`, `worktree.base=../worktrees`,
 Supported placeholders in patterns: `${project_name}`, `${slot}`. Unknown
 placeholders are an error.
 
-### post_setup hook
+### setup / teardown hooks
 
-Runs after a worktree is created, with the new worktree as the working directory.
-Environment provided:
+`hooks.setup` runs after a worktree is created; `hooks.teardown` runs before a
+worktree is removed (`wt remove`). Both run with the worktree as the working
+directory (teardown tolerates an already-deleted directory, so it can still
+release ports/processes). Environment provided:
 
 - `WT_MAIN_WORKTREE`, `WT_WORKTREE`, `WT_SLOT`, `WT_BRANCH`, `WT_PROJECT_NAME`
+- `WT_MODE` — `slot` or `task`
+- `WT_HOOK` — `setup` or `teardown`
 
-A failing hook leaves the worktree in place for debugging and `wt add` exits
-non-zero.
+A failing setup hook leaves the worktree in place for debugging and `wt add`
+exits non-zero; a failing teardown hook is a warning and `wt remove` continues.
+`hooks.post_setup` is the legacy name for `hooks.setup` (still accepted).
 
 ## Safety model
 
