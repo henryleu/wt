@@ -97,4 +97,44 @@ grep -q '^setup mode=slot slot=b' "$LOGF" 2>/dev/null \
     && ok "legacy post_setup ran the setup hook" \
     || fail "legacy post_setup ran the setup hook ($(cat "$LOGF" 2>/dev/null))"
 
+# HK6: the canonical hook body ("wt teardown") must not be self-killed by its
+# own proc stop. Regression: wt wraps hooks.teardown in a cwd-scoped subshell
+# that is an ANCESTOR of the `wt teardown` process; cwd_pids used to exclude
+# only the descendant subtree, so it signalled that wrapper and the hook was
+# reported as failed even though the cleanup completed.
+begintest "HK6 canonical teardown hook is not self-killed"
+cat > "$PROJECT/td.sh" <<EOF
+#!/usr/bin/env bash
+"$WT" teardown >/dev/null 2>&1 || true
+echo "td-complete" >> "\$WT_MAIN_WORKTREE/hook.log"
+EOF
+chmod +x "$PROJECT/td.sh"
+write_config <<EOF
+main_branch = "develop"
+
+[worktree]
+base = "../worktrees"
+pattern = "\${project_name}-\${slot}"
+
+[branch]
+pattern = "workspace/\${slot}"
+
+[merge]
+strategy = "no-ff"
+remote = "origin"
+push = false
+
+[hooks]
+teardown = "td.sh"
+EOF
+: > "$LOGF"
+(cd "$PROJECT" && "$WT" add c >/dev/null 2>&1) || fail "add c"
+(cd "$PROJECT" && "$WT" remove c >/tmp/hk6-remove.out 2>&1) || fail "remove c"
+grep -q '^td-complete$' "$LOGF" 2>/dev/null \
+    && ok "teardown hook ran to completion" \
+    || fail "teardown hook ran to completion (log: $(cat "$LOGF" 2>/dev/null))"
+grep -q 'teardown hook failed' /tmp/hk6-remove.out \
+    && fail "spurious 'teardown hook failed' warning" \
+    || ok "no spurious teardown-failure warning"
+
 finish

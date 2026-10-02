@@ -10,7 +10,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly WT_VERSION="0.2.0"
+readonly WT_VERSION="0.2.1"
 readonly WT_PROG="wt"
 readonly LOCK_TIMEOUT="${WT_LOCK_TIMEOUT:-60}" # seconds before failing lock wait
 readonly WT_COMMIT_TIMEOUT="${WT_COMMIT_TIMEOUT:-300}" # seconds per coding-agent call for wt commit
@@ -818,6 +818,20 @@ pid_subtree() {
         }'
 }
 
+# pid_ancestors PID: print PID's ancestor chain (parent, grandparent, ...),
+# space-separated (trailing space), stopping below PID 1.
+pid_ancestors() {
+    local pid="$1" ppid guard=0
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && [ "$guard" -lt 64 ]; do
+        ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+        [ -n "$ppid" ] || break
+        [ "$ppid" -gt 1 ] 2>/dev/null || break
+        printf '%s ' "$ppid"
+        pid="$ppid"
+        guard=$((guard + 1))
+    done
+}
+
 # cwd_pids DIR [EXCLUDE_PID...]: PIDs whose cwd is DIR or a descendant of it,
 # excluding any EXCLUDE_PID. Matches on cwd only -- never on process name.
 #
@@ -826,6 +840,10 @@ pid_subtree() {
 #      function's own lsof/awk/sort children never match their own scan.
 #   2. The entire `wt` process subtree ($$ and descendants) is excluded, so a
 #      $(...) subshell that wraps `wt proc stop` is never signalled either.
+#   3. The whole ancestor chain of `wt` is excluded too, so a lifecycle hook that
+#      calls `wt teardown` from *inside* the target worktree does not signal the
+#      shell that invoked it (e.g. `wt remove` wraps hooks.teardown in a
+#      cwd-scoped subshell, which is an ancestor, not a descendant).
 # $$ is the PID of the outer shell even inside subshells, so the subtree walk
 # always starts from the real `wt` process.
 cwd_pids() {
@@ -835,7 +853,7 @@ cwd_pids() {
     lsof="$(command -v lsof 2>/dev/null || true)"
     [ -n "$lsof" ] || lsof="/usr/sbin/lsof"
     [ -x "$lsof" ] || return 0
-    excl="$excl$(pid_subtree "$$")"
+    excl="$excl$(pid_subtree "$$")$(pid_ancestors "$$")"
     (
         cd / 2>/dev/null || cd "$HOME" 2>/dev/null || true
         "$lsof" -n -d cwd -Fn 2>/dev/null | awk -v dir="$dir" -v excl="$excl" '
