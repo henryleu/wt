@@ -66,6 +66,8 @@ to vendor it. Each project only commits its own `.wt.toml` and any hook scripts.
 ```bash
 cd <project>            # main worktree
 wt init                 # generate a default .wt.toml (main_branch auto-detected)
+# or, to also scaffold generic setup/teardown scripts and wire [hooks]:
+# wt init --scaffold-hooks
 git add .wt.toml && git commit
 wt add a                # create workspace slot "a" → ../worktrees/<name>-a
 cd ../worktrees/<name>-a
@@ -102,9 +104,10 @@ wt remove a             # remove a slot (branch retained)
 | `wt list` | Show all worktrees (main + linked) with branch and clean/dirty state. |
 | `wt status` | Show current workspace context and commits ahead of main. |
 | `wt current` | Machine-friendly, line-oriented current context. |
-| `wt init` | Generate a default `.wt.toml` (in the main worktree; `--force` to overwrite). |
+| `wt init [--scaffold-hooks]` | Generate a default `.wt.toml` (in the main worktree; `--force` to overwrite). `--scaffold-hooks` also writes `scripts/wt/hooks.sh` + `scripts/wt/extra.sh` and wires `[hooks]` (existing scripts are kept unless `--force`). |
 | `wt config get <key>` | Read a `.wt.toml` value (e.g. `main_branch`, `worktree.base`, `merge.remote`). |
 | `wt config set <key> <value>` | Write a `.wt.toml` value (booleans and integers preserve their TOML type). |
+| `wt config has <key>` | Exit 0 when the key exists and is non-empty (shell guards, e.g. `wt config has env`). |
 | `wt doctor` | Diagnose prerequisites and repository state. |
 | `wt help` / `wt version` | Help / version. |
 
@@ -117,7 +120,8 @@ absolute paths.
 > **Bootstrap:** run `wt init` in the main worktree to generate a commented
 > default `.wt.toml`. It auto-detects `main_branch` from the worktree's current
 > branch, refuses to overwrite an existing file (use `--force`), and works even
-> before `yq` is installed.
+> before `yq` is installed. Add `--scaffold-hooks` to also generate the generic
+> lifecycle scripts (see below).
 
 ```toml
 main_branch = "develop"                 # branch owned by the primary worktree
@@ -157,6 +161,7 @@ web = "10201-10400"
 setup = "scripts/setup-worktree.sh"       # optional; runs after a worktree is created
 # teardown = "scripts/teardown-worktree.sh" # optional; runs before it is removed
 # (hooks.post_setup is the legacy name for `setup`)
+# `wt init --scaffold-hooks` wires both to a generic scripts/wt/hooks.sh.
 
 [env.gateway]                           # optional declarative env plane (`wt env`)
 dir = "apps/gateway"
@@ -199,6 +204,15 @@ release ports/processes). Environment provided:
 A failing setup hook leaves the worktree in place for debugging and `wt add`
 exits non-zero; a failing teardown hook is a warning and `wt remove` continues.
 `hooks.post_setup` is the legacy name for `hooks.setup` (still accepted).
+
+`wt init --scaffold-hooks` generates a generic, mode-aware pair and wires it:
+
+- `scripts/wt/hooks.sh` — dispatches on `WT_HOOK`; task worktrees `wt claim
+  register` + `wt env materialize`, slot worktrees `wt env copy --from-main`
+  (both env steps guarded by `wt config has env`); teardown runs `wt teardown`.
+- `scripts/wt/extra.sh` — the project escape hatch, called with `setup` or
+  `teardown`; put irreducible project-specific steps here. The generated files
+  contain no project assumptions and are never overwritten without `--force`.
 
 ## Safety model
 

@@ -58,4 +58,19 @@ remote = "origin"
 push = true
 EOF
 
+# G6: config has — presence test used by generated hook guards.
+begintest "G6 config has"
+(cd "$PROJECT" && "$WT" config has main_branch) >/dev/null 2>&1 \
+    && ok "present key reports present" || fail "present key reports present"
+(cd "$PROJECT" && "$WT" config has no_such_key) >/dev/null 2>&1 \
+    && fail "absent key reports absent" || ok "absent key reports absent"
+rc=0
+(cd "$PROJECT" && "$WT" config has) >/dev/null 2>&1 || rc=$?
+assert_eq "missing key arg is a usage error" "2" "$rc"
+(cd "$PROJECT" && "$WT" config has env) >/dev/null 2>&1 \
+    && fail "absent [env] table reports absent" || ok "absent [env] table reports absent"
+printf '\n[env.app]\ndir = "apps/app"\n' >> "$PROJECT/.wt.toml"
+(cd "$PROJECT" && "$WT" config has env) >/dev/null 2>&1 \
+    && ok "declared [env.app] reports present" || fail "declared [env.app] reports present"
+
 finish

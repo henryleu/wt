@@ -52,6 +52,8 @@ push = false
 # removed. hooks.post_setup is the legacy name for `setup`.
 # setup    = "scripts/setup-worktree.sh"
 # teardown = "scripts/teardown-worktree.sh"
+# `wt init --scaffold-hooks` writes a generic scripts/wt/hooks.sh and wires
+# both of these to it (plus a scripts/wt/extra.sh escape hatch).
 
 [task]
 # Task-mode worktrees (ephemeral, one per task) use these settings.

@@ -115,7 +115,9 @@ Do all of this in the **primary checkout** (Orca's `ORCA_ROOT_PATH`, on the base
 branch Orca uses for new worktrees) and commit it.
 
 - [ ] 1. Install `wt` and `yq`; confirm `wt doctor` passes.
-- [ ] 2. Bootstrap `.wt.toml` with `wt init`, then add the `[task]` section.
+- [ ] 2. Bootstrap `.wt.toml` with `wt init` (add `--scaffold-hooks` to also
+      generate generic `scripts/wt/hooks.sh` + `scripts/wt/extra.sh`), then add
+      the `[task]` section.
 - [ ] 3. Add `.wt/` to `.gitignore`.
 - [ ] 4. Declare your app **roles** and their TCP ranges in `[task.port_ranges]`.
 - [ ] 5. Add a committed `orca.yaml` with `scripts.setup` and `scripts.archive`.
@@ -172,6 +174,7 @@ console = "10401-10600"
 [hooks]
 # `wt` runs these for *slot-mode* worktrees (`wt add` / `wt remove`); Orca drives
 # task-mode worktrees with `orca.yaml`, but the two paths share this contract.
+# `wt init --scaffold-hooks` writes a generic scripts/wt/hooks.sh and wires both.
 # setup    = "scripts/setup-worktree.sh"
 # teardown = "scripts/teardown-worktree.sh"
 

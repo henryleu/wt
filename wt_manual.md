@@ -127,6 +127,11 @@ wt config set ...   # tweak individual values if you prefer
 git add .wt.toml && git commit -m "add wt config"
 ```
 
+For a ready-to-run starting point, `wt init --scaffold-hooks` additionally writes
+`scripts/wt/hooks.sh` + `scripts/wt/extra.sh` and wires `[hooks].setup`/
+`[hooks].teardown` to the generic hook (existing scripts are kept unless
+`--force`).
+
 Alternatively, create `.wt.toml` by hand or via `wt config set`:
 
 ```toml
@@ -264,9 +269,10 @@ sure they are merged.
 | `wt list` | List all worktrees: role, slot, branch, clean/dirty. |
 | `wt status` | Show this workspace's context and how many commits it is ahead of main. |
 | `wt current` | Machine-friendly, line-oriented current context. |
-| `wt init` | Generate a default `.wt.toml` in the main worktree (`--force` overwrites). |
+| `wt init [--scaffold-hooks]` | Generate a default `.wt.toml` in the main worktree (`--force` overwrites). `--scaffold-hooks` also writes `scripts/wt/hooks.sh` + `scripts/wt/extra.sh` and wires `[hooks]`. |
 | `wt config get <key>` | Read a `.wt.toml` value. |
 | `wt config set <key> <value>` | Write a `.wt.toml` value (types preserved). |
+| `wt config has <key>` | Exit 0 when the key is set and non-empty (shell guards). |
 | `wt doctor` | Verify prerequisites and repository state. |
 | `wt help` | Full help text. |
 | `wt version` | Print version. |
@@ -451,7 +457,7 @@ main_branch=develop
 main_worktree=/Users/you/code/myproject
 ```
 
-### `wt config get|set`
+### `wt config get|set|has`
 
 ```bash
 wt config get main_branch            # develop
@@ -461,6 +467,9 @@ wt config get hooks.setup           # null if unset
 
 wt config set merge.push false       # writes push = false (a real TOML boolean)
 wt config set worktree.pattern '${project_name}-${slot}-v2'
+
+# Presence test for shell guards (exit 0 = set and non-empty):
+wt config has env && wt env materialize
 ```
 
 Keys are dotted TOML paths (`main_branch`, `worktree.base`, `merge.strategy`,
@@ -853,6 +862,22 @@ still be cleaned up, after which stale Git metadata is pruned).
 > installs/dependency changes can interfere. The hook mechanism does *not* imply
 > shared dependency trees are safe; that policy belongs to your project.
 
+### Scaffolding a canonical hook (`wt init --scaffold-hooks`)
+
+Rather than hand-writing the flow-agnostic plumbing, `wt init --scaffold-hooks`
+writes `scripts/wt/hooks.sh` (generic, mode-aware) and `scripts/wt/extra.sh`
+(project escape hatch) and wires both `[hooks].setup` and `[hooks].teardown` to
+`hooks.sh`. The generated hook contains no project assumptions:
+
+- **task** (`WT_MODE=task`): `wt claim register` then, when `[env]` is declared,
+  `wt env materialize`.
+- **slot** (`WT_MODE=slot`): when `[env]` is declared, `wt env copy --from-main`.
+- **teardown**: `wt teardown` (stop → archive → release ports → clear claim).
+- afterwards, `extra.sh` is called with the phase so project-specific steps have
+  a stable mount point.
+
+Existing scripts are never overwritten without `--force`; re-running is safe.
+
 ---
 
 ## 12. Scripting and agents
@@ -949,6 +974,7 @@ SETUP
 EVERY PROJECT ONCE
   cd <main-worktree>
   wt init                 # generate .wt.toml (main_branch auto-detected)
+  # wt init --scaffold-hooks   # + generic scripts/wt/hooks.sh & extra.sh, wired
   git add .wt.toml && git commit
   wt doctor
   wt add agent-a          # + agent-b, agent-c, ...
