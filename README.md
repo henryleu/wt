@@ -94,10 +94,11 @@ wt remove a             # remove a slot (branch retained)
 | `wt claim register\|read\|clear` | This worktree's identity claim in `<root>/.wt/task.json` (register allocates ports; read/clear inspect or drop it). Toolkit — the orchestrator owns task lifecycle. |
 | `wt task slug\|branch` | Pure branch↔slug helpers for the `[task].branch_pattern`. |
 | `wt port claim\|release\|list` | Per-project port registry (`~/.wt/ports/<key>.tsv`): allocate the lowest free port per app role, release, or list (TSV / `--json`). |
+| `wt proc start [role…]` | Start the `[proc.<role>]` processes detached (cwd = `dir`, which must stay inside the worktree) and wait for the role's health probe (`check` must name a `[[check]]` **url** probe); a role whose probe already passes is skipped. `--no-wait`/`--timeout`/`--json`. |
 | `wt proc stop --cwd DIR` | Signal processes whose **cwd** is inside DIR (TERM→KILL); never matches by name. Best-effort. |
 | `wt archive --slug S --path P…` | Best-effort snapshot of paths into `~/.wt/archive/<key>/<slug>/` with size/time budgets. |
 | `wt env materialize\|show\|get\|copy` | Declarative env plane (`[env]` manifest): render seed + `${slug}`/`${port.<role>}`/`${env.<KEY>}` values, resolve the effective chain, read one key, or copy env from main into a slot. |
-| `wt check [--json]` | Run the declarative `[[check]]` health probes; exit 1 when any fails. |
+| `wt check [--name NAME] [--json]` | Run the declarative `[[check]]` health probes (one named probe with `--name`); exit 1 when any fails. |
 | `wt teardown [--json]` | Canonical teardown for a worktree: stop processes → archive → release ports → clear claim (best-effort; always exits 0). |
 | `wt assert --mode main\|slot\|task` | Assert the current worktree's mode (exit 3 on mismatch) so hooks can guard where they run. |
 | `wt switch <branch>` | Switch this worktree's branch; creates new branches from the configured main branch. Refuses to switch a *linked* worktree to the main branch. |
@@ -178,6 +179,11 @@ CORS_ORIGINS = "http://localhost:${port.web}"
 name = "api"
 url = "http://localhost:${port.gateway}/api/v1/models"
 expect = 200
+
+[proc.gateway]                           # optional process plane (`wt proc start`)
+dir = "apps/gateway"                    # relative, inside the worktree (= the cwd)
+cmd = "vp run dev"                      # owns its own logging; wt sends stdout to /dev/null
+check = "api"                           # names the url [[check]] probe above (health endpoint)
 ```
 
 Defaults: `main_branch=develop`, `worktree.base=../worktrees`,

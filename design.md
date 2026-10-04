@@ -1175,6 +1175,7 @@ task.archive_budget = 60
 task.archive_max_bytes = 26214400
 [env] = absent (optional env plane)
 [[check]] = absent (optional probes)
+[proc] = absent (optional process plane)
 ```
 
 The implementation should either provide these defaults centrally or write them to a generated config only when explicitly requested. Do not mutate `.wt.toml` merely because a default is being used.
@@ -1194,6 +1195,10 @@ Examples:
 - a `task.port_ranges` key that is not a valid role name, or a duplicate
 - a port range not matching `^[0-9]{4,5}-[0-9]{4,5}$`, or with lo > hi, or outside 1024–65535
 - a non-positive-integer `task.archive_budget` / `task.archive_max_bytes`
+- a duplicate `[[check]]` name (a `proc.<role>.check` must resolve to one probe)
+- a `proc.<role>` without `cmd`, with an absolute or `..`-escaping `dir`, or with
+  a `check` that names no declared probe or a non-`url` one (a file probe cannot
+  prove the process is alive -- readiness needs a health endpoint)
 
 When in doubt, fail with a clear error rather than silently guessing.
 
@@ -2524,6 +2529,12 @@ classification.
   the **lowest free** port per role, skipping registered rows (any slug/role)
   and LISTEN sockets; with no `--role` it allocates every declared role.
   `release` frees rows (all or by role); `list` prints TSV or `--json`.
+- `wt proc start [ROLE…] [--no-wait] [--timeout SEC] [--json]` — start the
+  declared `[proc.<role>]` processes detached with cwd = `<worktree>/<dir>`, so
+  the cwd-scoped `wt proc stop` reaps them (`dir` must be relative and inside
+  the worktree — a cwd the stop cannot reach is a leaked process); skip a role
+  whose health probe already passes, otherwise wait up to the budget for that
+  probe (exit 1 when it never passes). Each poll runs only that one probe.
 - `wt proc stop --cwd DIR [--json]` — signal processes whose **cwd** is inside
   DIR (never by name), TERM then KILL. Best-effort; always exit 0.
 - `wt archive --slug S --path P… [--budget SEC] [--max-bytes N]` — best-effort
@@ -2531,8 +2542,8 @@ classification.
   budgets; never fails the caller.
 - `wt env materialize|show|get|copy` — the optional declarative env plane (§40.7),
   active only when `.wt.toml` has an `[env]` section.
-- `wt check [--json]` — run the declarative `[[check]]` probes (url/expect,
-  file/nonempty); exit 1 when any fails.
+- `wt check [--name NAME] [--json]` — run the declarative `[[check]]` probes
+  (url/expect, file/nonempty); exit 1 when any fails.
 - `wt teardown [--json]` — the canonical teardown recipe in order: stop
   processes → archive `[task].archive_paths` → release ports → clear the claim.
   Best-effort; always exit 0.
@@ -2577,6 +2588,22 @@ by `wt add`/`wt remove` for slots and by the orchestrator for tasks. Changes:
   exactly `${slug}`, `${port.<role>}`, `${env.<KEY>}` — no template engine.
 - **Declarative checks.** `[[check]]` probes (`name` + `url`[+`expect`] or
   `file`[+`nonempty`]) run by `wt check`.
+- **Declarative process plane.** An optional `[proc.<role>]` table (`dir`,
+  `cmd`, and the `check` probe name) lets `wt proc start [role…]` launch a
+  worktree's long-running processes detached; readiness and the already-running
+  skip reuse the same `[[check]]` probes, and teardown's `wt proc stop --cwd` is
+  the other half — which is why `dir` must be relative and stay inside the
+  worktree: a process the cwd-scoped stop cannot reach is a leak, not a feature.
+  `check` must name a **url** probe — the role's health endpoint — because that
+  is the only probe kind that also proves the process is alive, and a live
+  process is exactly what the idempotent skip depends on (a `file` probe would
+  report a dead app as `already-running` for as long as its marker survives).
+  `check` is optional, which is the escape hatch for a process that is not an
+  HTTP server at all (a worker, a queue consumer, a database): it is startable
+  and reapable, but it can never be skipped — every `wt proc start` starts
+  another copy, and the start note says so. **Setup hooks never start
+  processes** — starting is a runtime decision, and a worktree that keeps its
+  processes running is simply one that never calls stop.
 - **Canonical teardown.** `wt teardown` implements the fixed order
   stop → archive → release → clear.
 - **`[task]` additions.** `required_roles` (every new claim must carry a port

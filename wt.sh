@@ -243,6 +243,8 @@ validate_config() {
     esac
 
     validate_task_config
+    validate_check_config
+    validate_proc_config
 }
 
 # ----------------------------------------------------------------------------
@@ -665,8 +667,18 @@ sanitize_slug() {
 # ----------------------------------------------------------------------------
 
 json_escape() {
-    local s
-    s="$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' -e 's/\r/\\r/g')"
+    # Like the rest of this file, pure bash (no fork per call): json_escape is
+    # called for every field of every --json document. Newlines must be escaped
+    # -- JSON forbids raw control characters, and a caller like `wt claim read
+    # --json` can be handed a multi-line value (`--label`).
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\b'/\\b}"
+    s="${s//$'\f'/\\f}"
     printf '"%s"' "$s"
 }
 
@@ -983,6 +995,65 @@ cfg_check_field() {
     yq -r ".check[$i].\"$f\" // \"\"" "$(config_file)" 2>/dev/null || true
 }
 
+# check_index_by_name NAME: print the 0-based index of the [[check]] probe named
+# NAME; returns 1 when no probe carries that name. Deliberately a scan rather
+# than a yq filter: probe names are free-form, so interpolating one into a yq
+# expression would make a name containing a quote a syntax/injection problem.
+check_index_by_name() {
+    local want="$1" n i name
+    n="$(cfg_check_count)"
+    i=0
+    while [ "$i" -lt "${n:-0}" ]; do
+        name="$(cfg_check_field "$i" name)"
+        if [ "$name" = "$want" ]; then
+            printf '%s\n' "$i"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# cfg_check_kind IDX: "url", "file", or "" -- how the IDX-th probe decides
+# health. A url probe observes a live server; a file probe only observes that a
+# marker file exists, which is why `proc.<role>.check` must name a url probe.
+cfg_check_kind() {
+    local i="$1"
+    if [ -n "$(cfg_check_field "$i" url)" ]; then
+        printf 'url'
+    elif [ -n "$(cfg_check_field "$i" file)" ]; then
+        printf 'file'
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# [proc] manifest -- optional declarative process plane (wt proc start|stop).
+# One [proc.<role>] table per long-running process of a worktree; `check` names
+# the [[check]] probe that decides readiness and the already-running skip. The
+# role vocabulary is the same as [task.port_ranges] and [env.<role>].
+# ----------------------------------------------------------------------------
+
+# cfg_proc_present: true when at least one role is declared under [proc].
+cfg_proc_present() {
+    config_present || return 1
+    local n
+    n="$(yq -r '.proc // {} | length' "$(config_file)" 2>/dev/null || echo 0)"
+    [ "${n:-0}" -gt 0 ] 2>/dev/null
+}
+
+# cfg_proc_roles: newline list of roles declared under [proc].
+cfg_proc_roles() {
+    config_present || return 0
+    yq -r '.proc // {} | keys | .[]' "$(config_file)" 2>/dev/null | sed '/^$/d'
+}
+
+# cfg_proc_field ROLE FIELD: scalar string field ("" when unset).
+cfg_proc_field() {
+    local role="$1" field="$2"
+    config_present || return 0
+    yq -r ".proc.\"$role\".\"$field\" // \"\"" "$(config_file)" 2>/dev/null || true
+}
+
 # task_role_range ROLE: range for ROLE from port_ranges, else the declared
 # default; returns 1 when neither exists.
 task_role_range() {
@@ -1067,6 +1138,59 @@ validate_task_config() {
         [ -n "$req" ] || continue
         valid_role_name "$req" || die "configuration error: invalid task.required_roles entry '$req' (want ^[a-z][a-z0-9_-]*$)"
     done < <(cfg_task_required_roles)
+}
+
+# check_names: newline list of declared [[check]] probe names (unnamed probes
+# are skipped). One yq call, not one per probe: validate_config runs on every
+# command that touches the config.
+check_names() {
+    config_present || return 0
+    yq -r '.check // [] | map(.name // "") | .[]' "$(config_file)" 2>/dev/null | sed '/^$/d'
+}
+
+# validate_check_config: [[check]] names must be unique. `[proc.<role>].check`
+# resolves a name to one probe, so duplicates would make readiness depend on
+# whichever same-named probe happened to pass first.
+validate_check_config() {
+    local dup
+    dup="$(check_names | sort | uniq -d | sed -n '1p')"
+    [ -z "$dup" ] || die "configuration error: duplicate [[check]] name '$dup' in $(config_file)"
+    return 0
+}
+
+# validate_proc_config: every [proc.<role>] needs a cmd that can be launched
+# with a cwd inside the worktree, and its optional `check` must name a declared
+# *url* [[check]] probe -- the role's health endpoint. That is the only probe
+# kind that also proves the process is alive, which is exactly what the
+# already-running skip and the readiness gate both need; a typo or a file probe
+# would otherwise silently disable the wait.
+validate_proc_config() {
+    local role cmd chk dir idx kind names
+    names="$(check_names)"
+    for role in $(cfg_proc_roles); do
+        valid_role_name "$role" || die "configuration error: invalid proc role '$role' (want ^[a-z][a-z0-9_-]*$)"
+        cmd="$(cfg_proc_field "$role" cmd)"
+        [ -n "$cmd" ] || die "configuration error: proc.$role.cmd must not be empty"
+        # `dir` is the cwd the process is launched in, and `wt proc stop --cwd
+        # <worktree>` (hence `wt teardown`) only reaps processes whose cwd is
+        # inside the worktree -- so a dir that escapes it is a leaked process,
+        # not a feature. Keep it portable and relative, like worktree.base.
+        dir="$(cfg_proc_field "$role" dir)"
+        case "$dir" in
+            ""|.) ;;
+            /*) die "configuration error: proc.$role.dir must be relative to the worktree (got '$dir')" ;;
+            ../*|*/../*|*/..|..) die "configuration error: proc.$role.dir must stay inside the worktree (got '$dir')" ;;
+        esac
+        chk="$(cfg_proc_field "$role" check)"
+        if [ -n "$chk" ]; then
+            printf '%s\n' "$names" | grep -Fxq "$chk" \
+                || die "configuration error: proc.$role.check '$chk' matches no [[check]] name in $(config_file)"
+            idx="$(check_index_by_name "$chk")"
+            kind="$(cfg_check_kind "$idx")"
+            [ "$kind" = "url" ] \
+                || die "configuration error: proc.$role.check '$chk' must name a probe with a url (got ${kind:-neither url nor file}) -- a file probe proves a marker exists, not that the process is alive; give the role a health endpoint and a [[check]] url probe for it"
+        fi
+    done
 }
 
 # ----------------------------------------------------------------------------
@@ -1235,10 +1359,11 @@ USAGE
 Toolkit (flow-agnostic; callable from any worktree or an external orchestrator)
   wt claim register|read|clear      this worktree's identity claim (.wt/task.json)
   wt port claim|release|list        per-project port registry
+  wt proc start [role...]           start [proc.<role>] detached, wait on its [[check]]
   wt proc stop --cwd DIR            stop processes whose cwd is inside DIR
   wt archive --slug S --path P...   snapshot paths for a worktree
   wt env materialize|show|get|copy  declarative env plane ([env] manifest)
-  wt check [--json]                 run declarative health probes ([[check]])
+  wt check [--name NAME] [--json]   run declarative health probes ([[check]])
   wt teardown [--json]              canonical teardown (stop,archive,release,clear)
   wt assert --mode main|slot|task   assert the current worktree's mode
 
@@ -1293,11 +1418,15 @@ CONFIG (.wt.toml, committed to Git, read from the main worktree)
                          copy_from_main, and a [env.<app>.values] map using
                          ${slug} / ${port.<role>} / ${env.<KEY>}
   [[check]]              optional health probe: name + (url[+expect] | file[+nonempty])
+  [proc.<role>]          optional process plane for wt proc start: dir (relative,
+                         inside the worktree), cmd, and the name of the url
+                         [[check]] probe (the role's health endpoint)
 
 ENVIRONMENT
   WT_LOCK_TIMEOUT        seconds to wait for the project lock (default 60)
   WT_STATE_DIR           user-level state dir (default ~/.wt; ports, archive, locks)
   WT_CHECK_TIMEOUT       seconds per wt check probe (default 3)
+  WT_PROC_WAIT_TIMEOUT   seconds wt proc start waits for a role's probe (default 60)
 
 HOOK ENVIRONMENT (hooks.setup / hooks.teardown)
   WT_MAIN_WORKTREE WT_WORKTREE WT_SLOT WT_BRANCH WT_PROJECT_NAME
@@ -1353,6 +1482,7 @@ cmd_doctor() {
         if [ -n "$hs" ]; then check 1 "hooks.setup configured ($hs)"; fi
         if [ -n "$ht" ]; then check 1 "hooks.teardown configured ($ht)"; fi
         if cfg_env_present; then check 1 "env plane configured ($(cfg_env_apps | tr '\n' ' '))"; fi
+        if cfg_proc_present; then check 1 "process plane configured ($(cfg_proc_roles | tr '\n' ' '))"; fi
         nchk="$(cfg_check_count)"
         if [ "${nchk:-0}" -gt 0 ] 2>/dev/null; then check 1 "health checks declared ($nchk)"; fi
     fi
@@ -2765,9 +2895,235 @@ cmd_proc() {
     local sub="${1:-}"
     [ $# -ge 1 ] && shift || true
     case "$sub" in
-        stop) cmd_proc_stop "$@" ;;
-        ''|*) usage_error "proc requires a subcommand (stop)" ;;
+        start) cmd_proc_start "$@" ;;
+        stop)  cmd_proc_stop "$@" ;;
+        ''|*)  usage_error "proc requires a subcommand (start|stop)" ;;
     esac
+}
+
+# one_line STR: collapse newlines and repeated blanks so a multi-line
+# diagnostic can go into one stderr line or one JSON string (json_escape does
+# not escape newlines).
+one_line() { printf '%s' "$1" | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'; }
+
+# check_named_ok NAME [TIMEOUT]: 0 when the [[check]] probe NAME passes right
+# now. Only that probe runs (`wt check --name`), so a poll costs one probe
+# rather than the whole manifest. Sets CHECK_JSON to the last `wt check --json`
+# document (check_detail explains a failure out of it); `wt check` exits 1 while
+# the probe is unhealthy, so that status is tolerated here.
+check_named_ok() {
+    local name="$1" timeout="${2:-${WT_CHECK_TIMEOUT:-3}}" out ok
+    out="$(cmd_check --name "$name" --json --timeout "$timeout" 2>/dev/null || true)"
+    CHECK_JSON="$out"
+    ok="$(printf '%s' "$out" | yq -p=json -r '.checks[0].ok // false' 2>/dev/null || true)"
+    [ "$ok" = "true" ]
+}
+
+# check_detail: the last probe's `detail` field ("" when there is none). This is
+# where the probe explains itself -- "HTTP 000", "0 B", the URL it tried -- and
+# is what makes a wait timeout diagnosable at all.
+check_detail() {
+    printf '%s' "${CHECK_JSON:-}" | yq -p=json -r '.checks[0].detail // ""' 2>/dev/null || true
+}
+
+# proc_error MSG: report a proc-plane failure and exit 1. In --json mode a
+# machine-readable error document goes to stdout first, so a consumer of --json
+# always gets exactly one JSON document (never an empty stdout); the message
+# always goes to stderr. `json` is a local of the calling command, which bash's
+# dynamic scoping makes visible here.
+proc_error() {
+    if [ "${json:-false}" = "true" ]; then
+        printf '{"wait":false,"roles":[],"error":%s}\n' "$(json_escape "$(one_line "$1")")"
+    fi
+    die "$1"
+}
+
+# proc_require_valid: require_project + validate_config, except that in --json
+# mode a failure is first caught in a subshell so its message can be reported as
+# a JSON document instead of vanishing into an empty stdout. The parent-shell
+# calls then populate WT_CURRENT_ROOT/WT_MAIN.
+proc_require_valid() {
+    local err
+    if [ "$json" = "true" ]; then
+        if ! err="$( { require_project; validate_config; } 2>&1 )"; then
+            proc_error "$err"
+        fi
+    fi
+    require_project
+    validate_config
+}
+
+# proc_validate_roles [ROLE...]: check the requested roles against the declared
+# [proc] roles and set REQ_ROLES. Returns 1 with PROC_ERR set when nothing is
+# declared or a role is unknown. Runs in the caller's shell (never inside a
+# $(...)) so the caller reports the failure itself -- `--json` owes its consumer
+# a document even when the request is rejected.
+proc_validate_roles() {
+    local declared role
+    declared="$(cfg_proc_roles)"
+    if [ -z "$declared" ]; then
+        PROC_ERR="no [proc.<role>] declared in $(config_file)"
+        return 1
+    fi
+    if [ $# -eq 0 ]; then
+        REQ_ROLES="$(printf '%s' "$declared" | tr '\n' ' ')"
+        return 0
+    fi
+    for role in "$@"; do
+        if ! printf '%s\n' "$declared" | grep -Fxq "$role"; then
+            PROC_ERR="proc: unknown role '$role' (declared: $(printf '%s' "$declared" | tr '\n' ' ' | sed 's/ $//'))"
+            return 1
+        fi
+    done
+    REQ_ROLES="$*"
+    return 0
+}
+
+# proc_assert_probe_resolvable ROLE SLUG PORTS: fail fast when a role's `check`
+# probe still holds a ${...} placeholder after expansion. ${port.<role>} takes
+# its value from the worktree's claim, so an unresolved placeholder means the
+# probe can never pass -- otherwise that costs the whole wait budget and then
+# reports a misleading "did not pass probe". A probe with no placeholders (e.g.
+# a file probe) is fine without a claim.
+proc_assert_probe_resolvable() {
+    local role="$1" slug="$2" ports="$3" chk idx field raw expanded
+    chk="$(cfg_proc_field "$role" check)"
+    [ -n "$chk" ] || return 0
+    idx="$(check_index_by_name "$chk" || true)"
+    [ -n "$idx" ] || return 0
+    for field in url file; do
+        raw="$(cfg_check_field "$idx" "$field")"
+        [ -n "$raw" ] || continue
+        expanded="$(env_expand_str "$raw" "$slug" "$ports" "" 0)"
+        case "$expanded" in
+            *'${'*)
+                proc_error "proc start: $role probe '$chk' cannot pass: $field still holds a placeholder after expansion ($expanded) -- \${port.<role>} needs a claim that carries the role"
+                ;;
+        esac
+    done
+    return 0
+}
+
+# cmd_proc_start [ROLE...] [--no-wait] [--timeout SECONDS] [--json]
+#
+# Starts each role's `cmd` detached, with cwd = <worktree>/<dir> so that
+# `wt proc stop --cwd <worktree>` reaps it later (never by process name), then
+# waits for the role's `check` probe to pass. A role whose probe already passes
+# is skipped -- `check` is a url probe (validated), so passing means a live
+# server, and that skip is what makes re-runs idempotent. The
+# command owns its own logging: stdout/stderr go to /dev/null, so the app is
+# expected to redirect whatever else it wants kept (e.g. `... | tee dev.log`),
+# which is what [task].archive_paths then snapshots at teardown.
+cmd_proc_start() {
+    local no_wait=false json=false wait_s="${WT_PROC_WAIT_TIMEOUT:-60}" want_roles=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-wait) no_wait=true; shift ;;
+            --json)    json=true; shift ;;
+            --timeout) [ $# -ge 2 ] || usage_error "proc start: --timeout requires a value"; wait_s="$2"; shift 2 ;;
+            -*)        usage_error "proc start: unknown option '$1'" ;;
+            *)         [ -n "$1" ] || usage_error "proc start: empty role name"
+                       want_roles="$want_roles $1"; shift ;;
+        esac
+    done
+    case "$wait_s" in
+        ''|*[!0-9]*) usage_error "proc start: --timeout must be a non-negative integer" ;;
+    esac
+
+    proc_require_valid
+
+    # shellcheck disable=SC2086
+    proc_validate_roles $want_roles || proc_error "$(one_line "$PROC_ERR")"
+    local roles="$REQ_ROLES" role slug ports
+    slug="$(env_current_slug)"
+    ports="$(env_current_ports)"
+    for role in $roles; do
+        proc_assert_probe_resolvable "$role" "$slug" "$ports"
+    done
+
+    local json_roles="" failed=0
+    for role in $roles; do
+        local dir cmd chk abs state pid="" pid_json="null" check_json="null"
+        dir="$(cfg_proc_field "$role" dir)"
+        cmd="$(cfg_proc_field "$role" cmd)"
+        chk="$(cfg_proc_field "$role" check)"
+        case "$dir" in
+            ""|.) abs="$WT_CURRENT_ROOT" ;;
+            *)    abs="$WT_CURRENT_ROOT/$dir" ;;
+        esac
+
+        if [ -n "$chk" ] && check_named_ok "$chk"; then
+            state="already-running"
+        else
+            [ -d "$abs" ] || proc_error "proc start: $role dir does not exist: $abs"
+            # a symlinked dir can still resolve outside the worktree, which would
+            # put the cwd beyond the reach of the cwd-scoped stop
+            local abs_p root_p
+            abs_p="$(cd -P "$abs" 2>/dev/null && pwd -P)" || abs_p="$abs"
+            root_p="$(cd -P "$WT_CURRENT_ROOT" 2>/dev/null && pwd -P)" || root_p="$WT_CURRENT_ROOT"
+            case "$abs_p" in
+                "$root_p"|"$root_p"/*) ;;
+                *) proc_error "proc start: $role dir resolves outside the worktree: $abs_p" ;;
+            esac
+            # Detached and HUP-proof, with the cwd set by this script: the cmd
+            # string is passed as an argument, never interpolated into it, so no
+            # quoting inside `cmd` can move the cwd. `exec` keeps the pid, so for
+            # a simple cmd the reported pid is the app itself, not a wrapper.
+            ( exec sh -c 'cd "$1" || exit 1; exec nohup sh -c "$2"' _ "$abs" "$cmd" ) \
+                >/dev/null 2>&1 </dev/null &
+            pid=$!
+            state="started"
+        fi
+
+        if [ "$state" = "started" ] && [ -n "$chk" ] && [ "$no_wait" != "true" ]; then
+            # One probe per poll, each poll capped by the time left in the
+            # budget, so the wait tracks --timeout instead of drifting past it
+            # by one poll's worth of *every* declared probe.
+            local deadline remaining
+            deadline=$(( $(date +%s) + wait_s ))
+            while :; do
+                remaining=$(( deadline - $(date +%s) ))
+                [ "$remaining" -ge 1 ] || remaining=1   # --timeout 0 still probes once
+                check_named_ok "$chk" "$remaining" && break
+                [ "$(date +%s)" -lt "$deadline" ] || { state="failed"; break; }
+                sleep 0.5
+            done
+        fi
+
+        if [ "$state" = "failed" ]; then
+            failed=1
+            note "proc start: $role did not pass probe '$chk' within ${wait_s}s (dir=$abs cmd=$cmd)"
+            local detail
+            detail="$(check_detail)"
+            [ -z "$detail" ] || note "proc start:   probe '$chk': $detail"
+            if ! kill -0 "$pid" 2>/dev/null; then
+                note "proc start: $role already exited -- run '$cmd' in $abs to see the error"
+            else
+                note "proc start: $role is still running -- 'wt proc stop --cwd $WT_CURRENT_ROOT' reaps it"
+            fi
+        elif [ "$state" = "already-running" ]; then
+            note "proc start: $role already running (probe '$chk' passes)"
+        elif [ "$no_wait" = "true" ] && [ -n "$chk" ]; then
+            note "proc start: $role started (pid $pid, not waiting on probe '$chk')"
+        elif [ -n "$chk" ]; then
+            note "proc start: $role started (pid $pid, probe '$chk' passed)"
+        else
+            note "proc start: $role started (pid $pid, no check: a copy started earlier cannot be detected)"
+        fi
+
+        if [ -n "$pid" ]; then pid_json="$pid"; fi
+        if [ -n "$chk" ]; then check_json="$(json_escape "$chk")"; fi
+        if [ -n "$json_roles" ]; then json_roles="$json_roles,"; fi
+        json_roles="$json_roles{\"role\":$(json_escape "$role"),\"state\":$(json_escape "$state"),\"pid\":$pid_json,\"check\":$check_json}"
+    done
+
+    if [ "$json" = "true" ]; then
+        local wait_json="true"
+        if [ "$no_wait" = "true" ]; then wait_json="false"; fi
+        printf '{"wait":%s,"roles":[%s]}\n' "$wait_json" "$json_roles"
+    fi
+    [ "$failed" -eq 0 ] || exit 1
+    return 0
 }
 
 # csv_numbers WORDS: print "1,2,3" for a space/newline separated integer list.
@@ -3290,10 +3646,11 @@ http_code_of() {
 cmd_check() {
     require_project
     validate_config
-    local json=false timeout="${WT_CHECK_TIMEOUT:-3}"
+    local json=false timeout="${WT_CHECK_TIMEOUT:-3}" only=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --json)    json=true; shift ;;
+            --name)    [ $# -ge 2 ] || usage_error "check: --name requires a value"; only="$2"; shift 2 ;;
             --timeout) [ $# -ge 2 ] || usage_error "check: --timeout requires a value"; timeout="$2"; shift 2 ;;
             -*)        usage_error "check: unknown option '$1'" ;;
             *)         usage_error "check: unexpected argument '$1'" ;;
@@ -3302,15 +3659,26 @@ cmd_check() {
     local n
     n="$(cfg_check_count)"
     [ "${n:-0}" -gt 0 ] || die "no [[check]] probes declared in $(config_file)"
+    # --name narrows the run to one probe (used by `wt proc start`'s wait loop,
+    # which must not pay for every other probe on each poll); a typo is an error,
+    # not an empty pass.
+    if [ -n "$only" ]; then
+        check_names | grep -Fxq "$only" \
+            || die "check: no [[check]] probe named '$only' in $(config_file)"
+    fi
 
     local slug ports
     slug="$(env_current_slug)"
     ports="$(env_current_ports)"
 
-    local i=0 allok=1 json_checks="" human_lines=""
+    local i=0 allok=1 json_checks="" human_lines="" json_first=1
     while [ "$i" -lt "$n" ]; do
         local name url expect file nonempty ok=0 value detail
         name="$(cfg_check_field "$i" name)"
+        if [ -n "$only" ] && [ "$name" != "$only" ]; then
+            i=$((i + 1))
+            continue
+        fi
         [ -n "$name" ] || name="check$i"
         url="$(cfg_check_field "$i" url)"
         expect="$(cfg_check_field "$i" expect)"
@@ -3339,7 +3707,10 @@ cmd_check() {
             detail="(no url/file declared)"
         fi
         [ "$ok" -eq 1 ] || allok=0
-        [ "$i" -eq 0 ] || json_checks="$json_checks,"
+        # `json_first`, not the probe index: --name skips probes, so the index no
+        # longer says whether anything was emitted yet.
+        [ "$json_first" -eq 1 ] || json_checks="$json_checks,"
+        json_first=0
         json_checks="$json_checks{\"name\":$(json_escape "$name"),\"ok\":$(bool_json "$ok"),\"detail\":$(json_escape "$detail")}"
         human_lines="$human_lines$(printf '  %-12s %-4s %s' "$name" "$(bool_json "$ok")" "$detail")
 "
@@ -3760,6 +4131,21 @@ types = ["task"]
 # name     = "database"
 # file     = "apps/gateway/data/gateway.${slug}.sqlite"
 # nonempty = true
+
+# ---- optional declarative process plane (wt proc start|stop) ----------------
+# One table per long-running process. `wt proc start [role...]` starts the
+# declared roles detached (cwd = dir, so `wt proc stop --cwd` reaps them) and
+# waits for `check` -- which must name a url [[check]] probe above, i.e. the
+# role's health endpoint -- to pass; a role whose probe already passes is
+# skipped, which is what makes re-running the command a no-op. A url probe is
+# required because it is the only probe that also proves the process is alive;
+# a role without `check` therefore starts again on every run (the escape hatch
+# for a process that cannot serve health). dir must be a relative path inside
+# the worktree. The command owns its own logging.
+#[proc.gateway]
+# dir   = "apps/gateway"
+# cmd   = "vp run dev"
+# check = "api"
 EOF
     } > "$target"
 
@@ -3822,10 +4208,11 @@ Workflow
 Toolkit
   claim register|read|clear        this worktree's identity claim
   port claim|release|list          per-project port registry
+  proc start [role...]             start [proc.<role>] detached, wait on its [[check]]
   proc stop --cwd DIR              stop processes whose cwd is inside DIR
   archive --slug S --path P...     snapshot paths for a worktree
   env materialize|show|get|copy    declarative env plane ([env] manifest)
-  check [--json]                   run declarative health probes ([[check]])
+  check [--name NAME] [--json]     run declarative health probes ([[check]])
   teardown [--json]                canonical teardown (stop/archive/release/clear)
   assert --mode M                  assert the current worktree's mode
 

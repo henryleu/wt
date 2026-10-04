@@ -107,6 +107,7 @@ archive_max_bytes = 26214400         # 单文件大小上限（25 MiB）
 ```
 
 - 新增 `cfg_task_*` 访问器（沿用 `cfg_*` 默认值模式，wt.sh:188-201）；`validate_config`（wt.sh:204-231）新增校验：`branch_pattern` 必含 `${slug}`；range 匹配 `^[0-9]{4,5}-[0-9]{4,5}$` 且 lo ≤ hi、落在 1024–65535；port_ranges 键与角色同规则（`^[a-z][a-z0-9_-]*$`，重复/非法名 `die`）；budget/max_bytes 为正整数。失败沿用 `configuration error:` 前缀 `die`。
+- 过程面（可选模块，沿用 `[[check]]`/`[env]` 的 opt-in 风格）：`[proc.<role>]` 的 `dir`/`cmd`/`check`；唯一性 + url 约束：`[[check]].name` 唯一，`proc.<role>.check` 必须命中一个**带 `url` 的**探针；`validate_check_config` + `validate_proc_config` 在 `validate_config` 内串联执行（配置面校验一次全查，与 `--json` 的错误文档不冲突）。
 - 角色即配即用：未列入 `port_ranges` 的角色 claim 时走 `port_range_default`；两者皆无 → exit 1 报"no range for role R"。
 - `wt init` 模板（wt.sh:1478-1508）追加 `[task]` 注释块。
 
@@ -158,7 +159,21 @@ archive_max_bytes = 26214400         # 单文件大小上限（25 MiB）
 - release：awk 过滤行 + 同目录临时文件 + `mv`；不给 `--role` 释放该 slug 全部行，给了只释放指定角色（并同步收缩 claim 的 `ports` 映射，若有）；幂等；写失败仅 stderr 警告、恒 exit 0。
 - list：长表 TSV `slug\trole\tport\tcreated_at`（每 (slug, role) 一行，任意角色集友好；`--slug S` 过滤）；`--json` 输出对象数组 `[{"slug":...,"role":...,"port":...,"created_at":...}]`。
 
-### 5.7 `wt proc stop --cwd DIR [--json]`
+### 5.7 `wt proc start [ROLE...] [--no-wait] [--timeout SEC] [--json]` / `wt proc stop --cwd DIR [--json]`
+
+**start**：按 `[proc.<role>]`（`dir`/`cmd`/`check`）启动本 worktree 的常驻进程。
+
+- **就绪即健康端点**：`check` 必须是 url 探针（角色的 health endpoint，`name` + `url`，可选 `expect`）。它是唯一能同时证明"进程活着"的探针类型，因而既是就绪门，也是幂等跳过的前提——file 探针只能证明"marker 存在"，而 marker 活得比进程久，会把死掉的应用永远报成 `already-running`；故 file 探针（或无 url 无 file 的探针）在配置校验阶段直接 exit 1，提示给角色补一个健康端点。`check` 本身可选：不写则启动后不等待——这是给"根本不是 HTTP 服务"的进程（worker、队列消费者、数据库）的退路，但有代价：无法判定已有实例存活，故**每次 `wt proc start` 都会再起一份**（start 的 stderr note 会明说）；这类角色仍可被 `wt proc stop --cwd` / `wt teardown` 回收。
+
+- 角色解析：给了角色就按给定顺序逐个校验（未声明 → exit 1，stderr 列出已声明角色）；未给则默认 = `[proc]` 声明的全部角色（声明序）。空角色名 → exit 2（不能等价于"全部"）。
+- 每角色：`check` 探针已通过 → 跳过（`state=already-running`，幂等；url 探针通过即服务活着，故该跳过是安全的）；否则 `( exec sh -c 'cd "$1" || exit 1; exec nohup sh -c "$2"' _ <abs> <cmd> ) >/dev/null 2>&1 </dev/null &` 分离启动——`cmd` 以参数传入、绝不拼进脚本串，故 `cmd` 内部任何引号都不会改变 cwd；`exec` 链保持 pid 不变（单一简单命令下 `$!` 即应用自身，而非包装 shell）。cwd 落在 worktree 内，故 `wt proc stop --cwd` 可按 cwd 回收；stdout/stderr 归命令自理（如 `| tee dev.log`，再由 `[task].archive_paths` 快照）。
+- `dir` 必须是 worktree 内的相对路径（绝对路径或含 `..` → 配置校验 exit 1）；启动前再按 `cd -P` 规范化比对，符号链接解析到 worktree 外同样拒绝——cwd 回收不到的进程即泄漏。
+- 未给 `--no-wait` 时轮询该 `check` 至 `--timeout`（默认 `WT_PROC_WAIT_TIMEOUT`=60s）：每轮只跑 `wt check --name <probe>`（单个探针），且单轮超时上限 = 剩余预算，故等待时间随预算收敛（≈ 预算 + 一轮）而不随探针数量膨胀；超时 → 该角色 `state=failed`、stderr 附探针自身的 `detail`（如 `HTTP 000`）与"仍在运行"提示，其余角色继续启动，最终 exit 1。
+- 快速失败：请求角色的 `check` 探针若在展开后仍残留 `${...}` 占位符（如 claim 里没有 `${port.gateway}` 对应的角色），直接 exit 1 并指名占位符——否则必然白等到超时、再报一个误导性的"未通过探针"。
+- 配置校验：`proc.<role>.cmd` 必填；`dir` 相对且不外逃（绝对路径 / `..` 即 exit 1）；`proc.<role>.check` 若给出必须命中某个 `[[check]].name`（拼错即 exit 1）**且该探针必须带 `url`**；`[[check]].name` 必须唯一。
+- stdout：`--json` 输出 `{"wait":true,"roles":[{"role":"web","state":"started|already-running|failed","pid":1234|null,"check":"web"|null}]}`；请求本身被拒（未知角色、配置错、缺 dir、占位符未解析）时输出 `{"wait":false,"roles":[],"error":"..."}` 后 exit 1——**消费 `--json` 者永远拿到恰好一个 JSON 文档**，不会拿到空 stdout；人类可读信息一律 stderr。`--no-wait` 时 `wait=false` 且不做就绪判定（state 恒为 `started`）。**setup 钩子不调用它**：启动是运行时决定，长期常驻 = 启动后不 stop。
+
+**stop**：
 
 - `/usr/sbin/lsof -n -d cwd -Fn`（`command -v lsof` 兜底），匹配 cwd 在 DIR 内（含子目录）的进程，排除 `$$`/`$PPID`；`kill -TERM` → 每 100ms 轮询 `kill -0` 至多 5s → 存活者 `kill -KILL`。
 - stdout：被信号过的 PID 每行一个（无则空）；`--json`：`{"stopped":[123],"killed":[]}`。
@@ -228,6 +243,7 @@ wt claim clear
 - `test_port.sh`：两个项目 → 两个注册表文件（project_key 隔离）；角色集隔离（同 slug 不同角色各得各的）；未声明角色走 `port_range_default`；无 range 角色 exit 1；最低空闲选择；预置行（任意角色）跳过；真实监听（后台 `nc -l`，无 nc 则 skip）跳过；耗尽 exit 1（指明角色）；按 (slug, role) 幂等；追加新角色扩展 upsert 且同步 claim；release 全量/按角色幂等；长表 TSV 格式精确。
 - `test_context.sh`：main/slot/task 三态检测；`wt assert` 0/3；`wt current` 新行 + `--json`（yq 解析校验）；`wt sync` 跳过脏 task worktree 而非 die；`wt list` MODE 列。
 - `test_proc_archive.sh`：`proc stop` 杀 cwd 内 sleeper、排除自身 shell；archive 尊重 `--max-bytes`/`--budget`、缺路径不失败、落盘路径 `~/.wt/archive/<key>/<slug>/` 正确。
+- `test_proc_start.sh`：运行期用例（本地 `nc -k -l` 健康端点 + curl，缺任一则 skip）：启动阻塞到 url 探针通过且端口可用；探针已通过 → `already-running` 且不重复启动；无 `check` 的角色立即启动且 pid 即应用自身；探针不可达 → exit 1 且 stderr 指明探针名 + 附探针 `detail` + 提示仍在运行；`WT_PROC_WAIT_TIMEOUT` 生效；部分失败时其余角色照常启动且最终 exit 1；无参数 = 启动全部声明角色；启动出的进程 cwd 在 worktree 内，故 `proc stop --cwd` 可回收（端口随之释放）。配置/契约用例（无需网络）：缺 `cmd`、`--timeout` 非整数 → exit 2、空角色名 → exit 2、缺 `dir` → exit 1、绝对 `dir` / `..` 外逃 `dir` → exit 1、`check` 指向 file 探针或无目标探针 → exit 1、重复 `[[check]].name` → exit 1、探针残留 `${...}` 占位符 → 快速失败、未声明角色 / `--json` 错误文档、`wt check --name` 只跑一个探针且未知名字报错、`wt doctor` 报告 `[proc]`。退出时 trap 回收已启动 pid 与端口。
 
 ## 9. 实施阶段
 
@@ -235,7 +251,7 @@ wt claim clear
 |---|---|
 | A | 状态层：`WT_STATE_DIR`、`project_key`、claim 原子读写、`mode_of_path`、`note()` + `test_task.sh` 基础用例 |
 | B | 端口子系统：注册表文件/锁、`port claim/release/list` + `test_port.sh` |
-| C | `claim register/read/clear`、`task slug/branch`、`proc stop`、`archive`、`assert`、`current` 扩展 + `test_proc_archive.sh` |
+| C | `claim register/read/clear`、`task slug/branch`、`proc start/stop`、`archive`、`assert`、`current` 扩展 + `test_proc_archive.sh` + `test_proc_start.sh` |
 | D | `[task]` 配置 + 校验 + `init` 模板；`sync` 跳过；`remove` 拒绝；`doctor` 检查；文档更新 |
 
 ### 文档更新（本仓库）

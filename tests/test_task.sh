@@ -166,4 +166,35 @@ TASK4="$(t_add_task warn-me)"
 err="$(cd "$TASK4" && "$WT" claim register 2>&1 >/dev/null)"
 assert_contains "warns about .wt not ignored" "$err" "not ignored by Git"
 
+# ---------------------------------------------------------------------------
+# T11: --json escapes control characters. A free-form value (here a multi-line
+# --label) must never put a raw newline inside a JSON string: that is invalid
+# JSON (JSON.parse / jq / python all reject it) even though lenient readers like
+# yq shrug it off.
+# ---------------------------------------------------------------------------
+begintest "T11 json escapes control characters"
+TASK5="$(t_add_task escaping)"
+label="$(printf 'a\nb"c\\d\te')"
+(cd "$TASK5" && "$WT" claim register --label "$label" >/dev/null 2>&1) \
+    && ok "register accepts a multi-line label" || fail "register accepts a multi-line label"
+raw="$(cd "$TASK5" && "$WT" claim read --json 2>/dev/null)"
+case "$raw" in
+    *'a\nb'*) ok "embedded newline escaped as \\n" ;;
+    *) fail "embedded newline escaped as \\n" ;;
+esac
+case "$raw" in
+    *'c\\d'*) ok "embedded backslash escaped" ;;
+    *) fail "embedded backslash escaped" ;;
+esac
+assert_eq "label round-trips" "$label" "$(printf '%s' "$raw" | yq -p=json -r '.label')"
+if command -v python3 >/dev/null 2>&1; then
+    if printf '%s' "$raw" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; then
+        ok "document is strict JSON"
+    else
+        fail "document is strict JSON"
+    fi
+else
+    ok "python3 unavailable; skipping the strict-JSON parse"
+fi
+
 finish

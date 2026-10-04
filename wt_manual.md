@@ -534,6 +534,11 @@ PORT = "${port.gateway}"
 name = "api"
 url = "http://localhost:${port.gateway}/api/v1/models"
 expect = 200
+
+[proc.web]                                # optional process plane; see §16.2
+dir = "apps/web"                          # relative: the launch cwd, inside the worktree
+cmd = "vp run dev"                        # owns its own logging
+check = "api"                             # names the url [[check]] probe above
 ```
 
 Defaults if a key is omitted:
@@ -555,7 +560,7 @@ Defaults if a key is omitted:
 | `hooks.teardown` | absent |
 | `task.required_roles` | `[]` |
 | `task.archive_paths` | `[]` |
-| `[env]` / `[[check]]` | absent (opt-in modules) |
+| `[env]` / `[[check]]` / `[proc]` | absent (opt-in modules) |
 
 Placeholders (v1): **`${project_name}`** and **`${slot}`** only, in
 `worktree.pattern` and `branch.pattern`. Unknown placeholders are an **error** — `wt`
@@ -1046,13 +1051,14 @@ essentials:
 | `wt port claim [--slug S] [--role NAME]…` | Allocate the lowest free port per role (default: all declared roles). Idempotent per `(slug, role)`. |
 | `wt port release [--slug S] [--role NAME]…` | Free this slug's rows (all, or the named roles). Idempotent. |
 | `wt port list [--slug S] [--json]` | Long TSV `slug<TAB>role<TAB>port<TAB>created_at`, or a JSON array. |
+| `wt proc start [ROLE…] [--no-wait] [--timeout SEC] [--json]` | Start each declared `[proc.<role>]` detached with cwd = `<worktree>/<dir>`, then wait for its `[[check]]` **url** probe (the role's health endpoint); a role that already passes is skipped. Exit 1 when a probe never passes. |
 | `wt proc stop --cwd DIR [--json]` | TERM→KILL every process whose **cwd** is inside DIR (never by name). Always exit 0. |
 | `wt archive --slug S --path P… [--budget SEC] [--max-bytes N]` | Best-effort snapshot into `~/.wt/archive/<key>/<slug>/`. Always exit 0. |
 | `wt env materialize [--app NAME] [--force]` | Render the `[env]` manifest: seed (from main) + generated values with `${slug}`/`${port.<role>}`/`${env.<KEY>}`. |
 | `wt env show [--json]` | Resolve the effective runtime (last file wins) per app and key. |
 | `wt env get <KEY> [--app NAME]` | Print one effective value. |
 | `wt env copy --from-main [--app NAME]` | Slot mode: copy the manifest's files from main (never clobbers). |
-| `wt check [--json]` | Run the declarative `[[check]]` probes; exit 1 when any fails. |
+| `wt check [--name NAME] [--json]` | Run the declarative `[[check]]` probes (one named probe with `--name`); exit 1 when any fails. |
 | `wt teardown [--json]` | Canonical teardown: stop → archive → release ports → clear claim (best-effort; always exit 0). |
 | `wt assert --mode main\|slot\|task` | Classify the current worktree; exit 3 on mismatch. |
 | `wt current [--json]` | Now includes `mode=` and (task mode) `slug=` + `port.<role>=<n>`. |
@@ -1076,6 +1082,56 @@ web="$(printf '%s\n' "$claim" | sed -n 's/^port.web=//p')"
 # need another app's port at runtime? allocate by role on demand:
 wt port claim --slug "$slug" --role oss-proxy   # → port.oss-proxy=5601
 ```
+
+A setup hook **prepares** the worktree; it does **not** start long-running apps.
+Starting is a runtime decision — whoever needs a live app (a human, or an agent
+about to run an end-to-end check) runs `wt proc start`, optionally narrowed to
+one side with `wt proc start web`. It blocks until the role's health probe
+passes, and it is idempotent per role: a role whose probe already passes is
+skipped. Declare the roles it may start:
+
+```toml
+[proc.web]
+dir   = "apps/web"     # relative, inside the worktree: the launch cwd
+cmd   = "vp run dev"
+check = "web"          # must name a url [[check]] probe -- the health endpoint
+```
+
+- **`check` must be a url probe**: the role's health endpoint (`name` + `url`,
+  optionally `expect`). It is the only probe kind that also proves the process
+  is alive, which is what makes the skip above safe — a `file` probe would mean
+  "a marker exists", and a marker outlives the process, so a dead app would be
+  reported `already-running` forever. A file probe (or a probe with neither
+  target) is a config error. If an app has no health endpoint, add one; that is
+  the contract `wt proc start` needs. `check` itself is optional: without it a
+  role is started and never waited for. That is the escape hatch for a process
+  that is not an HTTP server at all (a worker, a queue consumer, a database),
+  but it has a price — nothing can prove an earlier copy is still up, so **every
+  `wt proc start` starts another one**. Such a role is still reaped by
+  `wt proc stop --cwd` / `wt teardown`, and the start note says so explicitly.
+- **`dir` is the cwd**, and it must stay inside the worktree: `wt proc stop
+  --cwd <worktree>` (hence `wt teardown`) reaps only processes whose cwd is in
+  there, so a `dir` that escapes the worktree — absolute, or via `..` — is
+  rejected instead of starting a process nothing will ever stop.
+- **`--timeout SEC`** (default `WT_PROC_WAIT_TIMEOUT`, 60s) is the wait budget.
+  Each poll runs only that role's probe, so the wait tracks the budget instead of
+  growing with the number of probes; on timeout the role is reported `failed`,
+  the probe's own explanation (`HTTP 000`, the path it tried) goes to stderr, the
+  other roles still start, and the exit code is `1`.
+- **`--json` always prints one JSON document**, successes and failures alike:
+  `{"wait":bool,"roles":[{"role":…,"state":"started|already-running|failed","pid":N|null,"check":…}]}`,
+  or `{"wait":false,"roles":[],"error":…}` when the request itself is rejected.
+- **The reported `pid` is the process `wt` started** — for a simple `cmd` that is
+  the app itself. If `cmd` is a pipeline or backgrounds itself, it is the wrapper
+  shell; expect it to be short-lived, and rely on the cwd-based reaping rather
+  than on a pid.
+
+The command owns its own logging (`wt proc start` sends stdout/stderr to
+`/dev/null`), so redirect what you want kept — `cmd = "vp run dev | tee dev.log"`
+— and list that file in `[task].archive_paths` to have teardown snapshot it.
+`wt proc start` fails fast when a probe still holds an unresolvable `${...}`
+placeholder (e.g. `${port.gateway}` in a worktree whose claim lacks that role),
+because such a probe can never pass.
 
 ### 16.3 Writing a teardown hook
 
@@ -1145,6 +1201,9 @@ nonempty = true
 `nonempty`]), prints human output or `--json`, and exits `0` when all pass, `1`
 when any fails, `2` on a usage error. It is read-only — it never starts or stops
 a server. Per-probe timeout: `--timeout SEC` or `WT_CHECK_TIMEOUT` (default 3s).
+`--name NAME` runs (and reports) only the probe with that name — what `wt proc
+start` polls — and an unknown name is an error, not an empty pass. Probe names
+must be unique.
 
 ### 16.4 Notes and gotchas
 - `wt sync` **skips** task worktrees, so a dirty or detached one never blocks a
