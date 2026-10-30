@@ -77,10 +77,12 @@ types = ["task"]
 # web = "10201-10400"
 
 # Optional declarative env plane (`wt env materialize|show|get|copy`). wt
-# implements a file chain plus three placeholder classes (${slug},
-# ${port.<role>}, ${env.<KEY>}) and never project-specific dotenv semantics.
+# implements a file chain plus a small placeholder language (${slug},
+# ${port.<role>}, ${env.<KEY>}, and the db forms ${db_name} /
+# ${db.<name>.<field>}) and never project-specific dotenv semantics.
 #[env.gateway]
 # dir          = "apps/gateway"
+# db           = "default"              # bind to a [[db]] for ${db_name}
 # files        = [".env", ".env.development", ".env.development.local"]
 # seed         = "scripts/seed/gateway.env"   # read from the main worktree
 # seed_target  = ".env.development"           # where the seed is written
@@ -98,3 +100,49 @@ types = ["task"]
 # name     = "database"
 # file     = "apps/gateway/data/gateway.${slug}.sqlite"
 # nonempty = true
+
+# Optional declarative database lifecycle (`wt db`). A [[db]] block declares
+# shell command lines; wt owns lifecycle ordering, ${slug}/${db_name}/${archive}
+# substitution, idempotent create, existence/version probes, the
+# only-drop-our-own-name guard, and best-effort teardown. No SQL lives in wt.
+# One block per resource; --name selects one (default name: "default").
+#
+# Placeholders: ${slug}, ${db_slug} (identifier-safe), ${db_name}, ${archive},
+# ${port.<role>}, ${env.<KEY>}, ${db.<name>.<field>}.
+#
+# Create is idempotent (wt probes existence first). Drop runs only when the
+# resolved name is proven to be this worktree's own: db_name must contain
+# ${slug} or ${db_slug}, every drop command line must reference ${db_name} or
+# ${db_slug} (or $WT_DB_NAME/$WT_DB_SLUG), and the main worktree never drops.
+# `migrate` is optional and project-owned unless it is truly lifecycle-tied.
+#
+# Postgres, one database per worktree, using client tools:
+#[[db]]
+# name    = "default"
+# dialect = "postgres"
+# scope   = "database"                 # database | schema
+# db_name = "loom_${db_slug}"
+# url     = "postgresql://localhost:5432/${db_name}"
+# create  = ["createdb ${db_name}"]
+# migrate = []                        # empty = project-owned (no-op)
+# backup  = ["pg_dump -Fc -f ${archive}/${db_name}.dump ${db_name}"]
+# drop    = ["psql postgres -qc \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${db_name}'\"", "dropdb --if-exists ${db_name}"]
+#
+# Postgres, one schema per worktree in a shared database (when the dev account
+# cannot CREATE/DROP DATABASE):
+#[[db]]
+# name     = "default"
+# dialect  = "postgres"
+# scope    = "schema"
+# database = "loom"                   # the shared database to connect to
+# db_name  = "loom_${db_slug}"         # the per-worktree schema
+# create   = ["psql loom -qc 'CREATE SCHEMA IF NOT EXISTS ${db_name}'"]
+# drop     = ["psql loom -qc 'DROP SCHEMA IF EXISTS ${db_name} CASCADE'"]
+#
+# SQLite (keeps the R1 file-based shape):
+#[[db]]
+# name    = "default"
+# dialect = "sqlite"
+# db_name = "data/loom.${slug}.sqlite"
+# create  = ["mkdir -p data && touch ${db_name}"]
+# drop    = ["rm -f ${db_name}"]

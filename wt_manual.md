@@ -527,8 +527,21 @@ seed = "scripts/seed/gateway.env"
 seed_target = ".env.development"
 gen = ".env.development.local"
 copy_from_main = [".env.development", ".env.development.local"]
+db = "default"                           # optional: bind to a [[db]] for ${db_name}
 [env.gateway.values]
 PORT = "${port.gateway}"
+DATABASE_URL = "${db.default.url}"
+
+[[db]]                                    # optional database lifecycle; see §16.7
+name = "default"
+dialect = "postgres"
+scope = "database"
+db_name = "loom_${db_slug}"
+url = "postgresql://localhost:5432/${db_name}"
+create = ["createdb ${db_name}"]
+migrate = []
+backup = ["pg_dump -Fc -f ${archive}/${db_name}.dump ${db_name}"]
+drop = ["dropdb --if-exists ${db_name}"]
 
 [[check]]                                 # optional probes for `wt check`; see §16.6
 name = "api"
@@ -560,7 +573,10 @@ Defaults if a key is omitted:
 | `hooks.teardown` | absent |
 | `task.required_roles` | `[]` |
 | `task.archive_paths` | `[]` |
-| `[env]` / `[[check]]` / `[proc]` | absent (opt-in modules) |
+| `[env]` / `[[check]]` / `[proc]` / `[[db]]` | absent (opt-in modules) |
+| `db.<name>.scope` | `database` |
+| `db.<name>.min_version` | `14` |
+| `db.<name>.maintenance_db` | `postgres` |
 
 Placeholders (v1): **`${project_name}`** and **`${slot}`** only, in
 `worktree.pattern` and `branch.pattern`. Unknown placeholders are an **error** — `wt`
@@ -1001,6 +1017,13 @@ QUICK COMMIT (no agent needed)
 NEXT TASK IN SAME SLOT
   wt switch workspace/<new-task>
 
+DATABASES (optional [[db]] manifest)
+  wt db create             # idempotent; PG preflight (reachable, >= min_version)
+  wt db status             # reachable? exists? (sqlite: nonempty?)
+  wt db migrate            # declared command; empty = project-owned no-op
+  wt db backup             # pg_dump into ~/.wt/archive/<key>/<slug>/
+  wt db drop               # own slug only; never from main, never a wildcard
+
 BOARD / CLEANUP
   wt list
   wt remove agent-c
@@ -1054,12 +1077,13 @@ essentials:
 | `wt proc start [ROLE…] [--no-wait] [--timeout SEC] [--json]` | Start each declared `[proc.<role>]` detached with cwd = `<worktree>/<dir>`, then wait for its `[[check]]` **url** probe (the role's health endpoint); a role that already passes is skipped. Exit 1 when a probe never passes. |
 | `wt proc stop --cwd DIR [--json]` | TERM→KILL every process whose **cwd** is inside DIR (never by name). Always exit 0. |
 | `wt archive --slug S --path P… [--budget SEC] [--max-bytes N]` | Best-effort snapshot into `~/.wt/archive/<key>/<slug>/`. Always exit 0. |
-| `wt env materialize [--app NAME] [--force]` | Render the `[env]` manifest: seed (from main) + generated values with `${slug}`/`${port.<role>}`/`${env.<KEY>}`. |
+| `wt db create\|migrate\|backup\|status\|drop [--name N] [--json]` | Declarative database lifecycle (`[[db]]`). Idempotent create, archive snapshot, own-name-only drop. |
+| `wt env materialize [--app NAME] [--force]` | Render the `[env]` manifest: seed (from main) + generated values with `${slug}`/`${port.<role>}`/`${env.<KEY>}`/`${db_name}`/`${db.<name>.<field>}`. |
 | `wt env show [--json]` | Resolve the effective runtime (last file wins) per app and key. |
 | `wt env get <KEY> [--app NAME]` | Print one effective value. |
 | `wt env copy --from-main [--app NAME]` | Slot mode: copy the manifest's files from main (never clobbers). |
-| `wt check [--name NAME] [--json]` | Run the declarative `[[check]]` probes (one named probe with `--name`); exit 1 when any fails. |
-| `wt teardown [--json]` | Canonical teardown: stop → archive → release ports → clear claim (best-effort; always exit 0). |
+| `wt check [--name NAME] [--json]` | Run the declarative `[[check]]` probes (one named probe with `--name`) plus a `db:<name>` database preflight; exit 1 when any fails. |
+| `wt teardown [--json]` | Canonical teardown: stop → db snapshot → archive paths → db drop → release ports → clear claim (best-effort; always exit 0). |
 | `wt assert --mode main\|slot\|task` | Classify the current worktree; exit 3 on mismatch. |
 | `wt current [--json]` | Now includes `mode=` and (task mode) `slug=` + `port.<role>=<n>`. |
 
@@ -1075,6 +1099,8 @@ claim="$(wt claim register)"                 # idempotent: reprints an existing 
 slug="$(printf '%s\n' "$claim" | sed -n 's/^slug=//p')"
 # With an [env] manifest, one command renders seed + per-task env values:
 wt env materialize                           # ${slug}/${port.<role>} -> env files
+# With a [[db]] manifest, create this worktree's own database/schema:
+wt db create                                 # idempotent; PG preflight
 # Without a manifest, read ports and generate env yourself:
 gateway="$(printf '%s\n' "$claim" | sed -n 's/^port.gateway=//p')"
 web="$(printf '%s\n' "$claim" | sed -n 's/^port.web=//p')"
@@ -1177,7 +1203,10 @@ DB   = "data/g.${slug}.sqlite"      # the slug
 ```
 
 - **Placeholders:** `${slug}`, `${port.<role>}`, `${env.<KEY>}` (the last
-  resolves against the same app's declared values).
+  resolves against the same app's declared values), plus the database forms
+  `${db_name}` and `${db.<name>.<field>}`. Bind the app with `db = "default"`
+  (or use the explicit `${db.default.url}`) to derive a connection string from
+  a `[[db]]` block instead of duplicating it.
 - `wt env materialize` writes the seed and generated values, never clobbering an
   existing file unless `--force`.
 - `wt env show`/`get` read the `files` chain (last file wins), matching how the
@@ -1203,7 +1232,71 @@ when any fails, `2` on a usage error. It is read-only — it never starts or sto
 a server. Per-probe timeout: `--timeout SEC` or `WT_CHECK_TIMEOUT` (default 3s).
 `--name NAME` runs (and reports) only the probe with that name — what `wt proc
 start` polls — and an unknown name is an error, not an empty pass. Probe names
-must be unique.
+must be unique. Each `[[db]]` also adds a synthetic `db:<name>` probe: for
+postgres it checks reachability and `server_version_num >= min_version` (default
+14), so setup fails before a migration; for sqlite it checks file non-emptiness.
+
+### 16.7 Database lifecycle (`[[db]]` / `wt db`)
+
+A `[[db]]` block is a **dialect-agnostic command manifest**. `wt` owns the
+lifecycle; the project declares the commands (no SQL lives in `wt`):
+
+```toml
+[[db]]
+name    = "default"
+dialect = "postgres"            # postgres | sqlite
+scope   = "database"           # database | schema
+db_name = "loom_${db_slug}"     # ${db_slug} is identifier-safe
+url     = "postgresql://localhost:5432/${db_name}"
+create  = ["createdb ${db_name}"]
+migrate = []                    # empty = project-owned; wt migrate is a no-op
+backup  = ["pg_dump -Fc -f ${archive}/${db_name}.dump ${db_name}"]
+drop    = ["dropdb --if-exists ${db_name}"]
+```
+
+Each entry is one shell command line, run in order from the worktree root.
+Available placeholders: `${slug}`, `${db_slug}`, `${db_name}`, `${archive}`,
+`${port.<role>}`, `${env.<KEY>}`, `${db.<name>.<field>}`. The same values are
+exported as `WT_DB_NAME`, `WT_DB_SLUG`, `WT_DB_ARCHIVE`.
+
+- `wt db create` is **idempotent**: it probes existence first (`exists`, then
+  `pg_database`/`pg_namespace`, or file non-empty for sqlite) and skips an
+  existing target. It records the exact created name in `.wt/db/<name>`.
+- `wt db status` reports reachability, server version, and whether the target
+  exists. Exit 1 when anything is missing.
+- `wt db migrate` runs the declared command; an empty `migrate` is a clean no-op
+  (migrate/seed stay project-owned unless genuinely lifecycle-tied).
+- `wt db backup` runs `pg_dump` (or whatever `backup` declares) into
+  `${archive}` = `~/.wt/archive/<key>/<slug>/` — the same root as `wt archive`.
+- `wt db drop` is guarded by `wt`, never by the declared command alone:
+  `db_name` must contain `${slug}`/`${db_slug}`, every drop command line must
+  reference `${db_name}`/`${db_slug}` (or `$WT_DB_NAME`/`$WT_DB_SLUG`), the
+  resolved name must be a safe identifier/path (no wildcard, quote, or
+  traversal), it must match the create record, and the **main worktree never
+  drops**. `wt teardown` calls it with `--best-effort`: it snapshots first and
+  always exits 0.
+
+Both isolation shapes are config choices:
+
+```toml
+# one DB per worktree
+scope = "database"
+db_name = "loom_${db_slug}"
+create = ["createdb ${db_name}"]
+drop = ["dropdb --if-exists ${db_name}"]
+
+# one schema per worktree in a shared DB (no CREATE/DROP DATABASE privilege)
+scope = "schema"
+database = "loom"
+db_name = "loom_${db_slug}"
+create = ["psql loom -qc 'CREATE SCHEMA IF NOT EXISTS ${db_name}'"]
+drop = ["psql loom -qc 'DROP SCHEMA IF EXISTS ${db_name} CASCADE'"]
+```
+
+A bundled client (for example `loom-db`) can replace the default probes with
+`ping`, `version` (`server_version_num`), and `exists` command arrays; the rest
+of the lifecycle is unchanged. `dialect = "sqlite"` keeps the classic
+file-based shape (`db_name = "data/loom.${slug}.sqlite"`).
 
 ### 16.4 Notes and gotchas
 - `wt sync` **skips** task worktrees, so a dirty or detached one never blocks a
@@ -1212,8 +1305,10 @@ must be unique.
 - `wt commit` works normally inside a task worktree (`wt merge`, too — it is the
   recommended "integrate" step). Make sure `.wt/` is gitignored so the claim is
   not committed.
-- `project_key` is derived from the remote URL; changing it moves the registry
-  and archive. `wt doctor` prints the current key.
+- `project_key` is derived from the remote URL; changing it moves the registry,
+  archive, and db backups. `wt doctor` prints the current key.
+- `wt teardown` in the **main** worktree never drops a database; it still
+  snapshots it. Per-worktree drops only happen in task/slot worktrees.
 
 ---
 

@@ -2540,13 +2540,18 @@ classification.
 - `wt archive --slug S --path P… [--budget SEC] [--max-bytes N]` — best-effort
   snapshot into `~/.wt/archive/<project_key>/<slug>/`, honoring size and time
   budgets; never fails the caller.
+- `wt db create|migrate|backup|status|drop [--name N] [--json]` — the optional
+  declarative database lifecycle (§40.8), active only when `.wt.toml` has a
+  `[[db]]` block. `drop` additionally accepts the internal `--best-effort`
+  mode used by teardown.
 - `wt env materialize|show|get|copy` — the optional declarative env plane (§40.7),
   active only when `.wt.toml` has an `[env]` section.
 - `wt check [--name NAME] [--json]` — run the declarative `[[check]]` probes
-  (url/expect, file/nonempty); exit 1 when any fails.
+  (url/expect, file/nonempty) plus one `db:<name>` preflight per `[[db]]`;
+  exit 1 when any fails.
 - `wt teardown [--json]` — the canonical teardown recipe in order: stop
-  processes → archive `[task].archive_paths` → release ports → clear the claim.
-  Best-effort; always exit 0.
+  processes → db snapshot → archive `[task].archive_paths` → db drop → release
+  ports → clear the claim. Best-effort; always exit 0.
 - `wt assert --mode main|slot|task` — classify the current worktree; exit 3 on
   mismatch. Callers decide their own force-bypass policy.
 
@@ -2635,13 +2640,70 @@ by `wt add`/`wt remove` for slots and by the orchestrator for tasks. Changes:
 
 ```text
 proc stop --cwd <worktree>            # quiesce
-archive --slug <slug> --path <archive_paths>   # snapshot
+db backup --slug <slug>               # database snapshot (when [[db]] exists)
+archive --slug <slug> --path <archive_paths>   # file snapshot
+db drop --best-effort                 # own db/schema only (when [[db]] exists)
 port release --slug <slug>            # free ports
 claim clear                           # drop identity
 ```
 
 Every step is best-effort; the command always exits 0, so it is safe as a hook
 body. `[task].archive_paths` supplies the archive list.
+
+## 40.8 Declarative database lifecycle (v2.3, `[[db]]` / `wt db`)
+
+The database lifecycle follows the same rule as the env/check/proc planes: the
+project declares data, `wt` owns mechanism. A `[[db]]` block is a
+**dialect-agnostic command manifest**; no SQL lives in `wt`. This keeps the
+"only drop our own DB" guard and the teardown time budget in the toolkit rather
+than in project bash hooks.
+
+```toml
+[[db]]
+name    = "default"
+dialect = "postgres"           # postgres | sqlite
+scope   = "database"          # database | schema
+db_name = "loom_${db_slug}"
+url     = "postgresql://localhost:5432/${db_name}"
+create  = ["createdb ${db_name}"]
+migrate = []
+backup  = ["pg_dump -Fc -f ${archive}/${db_name}.dump ${db_name}"]
+drop    = ["dropdb --if-exists ${db_name}"]
+```
+
+- **Fields.** `name` (selector, default `default`), `dialect`, `scope`,
+  `db_name` (template), `url`, optional connection fields (`host`, `port`,
+  `user`, `database`, `maintenance_db`, `min_version`, `nonempty`) and optional
+  probe overrides (`ping`, `version`, `exists`) for a bundled client. `create`,
+  `migrate`, `backup`, `drop` are arrays of shell command lines.
+- **Placeholders.** `${slug}`, `${db_slug}` (identifier-safe), `${db_name}`,
+  `${archive}`, `${port.<role>}`, `${env.<KEY>}`, `${db.<name>.<field>}`. The
+  env plane may bind an app (`[env.<app>].db`) and use `${db_name}` /
+  `${db.<name>.<field>}` in `[env.<app>.values]`, so a `DATABASE_URL` is
+  derived from the same manifest instead of duplicating the connection shape.
+- **Idempotent create.** Existence is probed first: a declared `exists`
+  command, `pg_database`/`pg_namespace` for postgres, or file+nomenpty for
+  sqlite. An existing target is skipped, so `createdb`/`CREATE DATABASE` need
+  not be idempotent.
+- **Drop guard (mandatory).** When `drop` is declared, `db_name` must contain
+  `${slug}` or `${db_slug}`, and every drop command line must reference
+  `${db_name}`/`${db_slug}` (or `$WT_DB_NAME`/`$WT_DB_SLUG`) so a hardcoded name
+  cannot bypass the guard. At drop time the resolved name must be a safe
+  identifier/path (no wildcard, quote, or traversal), must still contain this
+  worktree's slug, and must match the name recorded by `create` under
+  `.wt/db/<name>`. `wt db drop` refuses the main worktree. This is enforced by
+  `wt`, never by the declared command alone.
+- **Best-effort teardown.** Teardown snapshots first (`db backup`) and drops
+  after the file archive; any failure is reported but the command exits 0.
+- **Preflight.** For postgres, create/migrate/check/doctor verify reachability
+  and `server_version_num >= min_version` (default 14) before doing work, so
+  setup fails early instead of halfway through a migration.
+- **Isolation is a config choice.** `scope = "database"` gives one DB per
+  worktree (`createdb`/`dropdb`); `scope = "schema"` gives one schema in a
+  shared `database` (`CREATE SCHEMA`/`DROP SCHEMA`), for dev accounts without
+  CREATE/DROP DATABASE. `dialect = "sqlite"` keeps the R1 file-based shape.
+  Migrate/seed are optional and project-owned by default (an undeclared
+  `migrate` is a clean no-op).
 
 ---
 

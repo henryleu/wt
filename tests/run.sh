@@ -27,6 +27,7 @@ FILES=(
     test_proc_start.sh
     test_hooks.sh
     test_env_check.sh
+    test_db.sh
     test_remove.sh
     test_init.sh
 )

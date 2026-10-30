@@ -97,9 +97,10 @@ wt remove a             # remove a slot (branch retained)
 | `wt proc start [role…]` | Start the `[proc.<role>]` processes detached (cwd = `dir`, which must stay inside the worktree) and wait for the role's health probe (`check` must name a `[[check]]` **url** probe); a role whose probe already passes is skipped. `--no-wait`/`--timeout`/`--json`. |
 | `wt proc stop --cwd DIR` | Signal processes whose **cwd** is inside DIR (TERM→KILL); never matches by name. Best-effort. |
 | `wt archive --slug S --path P…` | Best-effort snapshot of paths into `~/.wt/archive/<key>/<slug>/` with size/time budgets. |
-| `wt env materialize\|show\|get\|copy` | Declarative env plane (`[env]` manifest): render seed + `${slug}`/`${port.<role>}`/`${env.<KEY>}` values, resolve the effective chain, read one key, or copy env from main into a slot. |
-| `wt check [--name NAME] [--json]` | Run the declarative `[[check]]` health probes (one named probe with `--name`); exit 1 when any fails. |
-| `wt teardown [--json]` | Canonical teardown for a worktree: stop processes → archive → release ports → clear claim (best-effort; always exits 0). |
+| `wt db create\|migrate\|backup\|status\|drop` | Declarative database lifecycle (`[[db]]` manifest). `create` is idempotent, `backup` writes into the archive dir, `drop` only ever drops the worktree's own `${db_name}`/schema (never a wildcard, never from the main worktree). `--name` selects a block; `--json` available. |
+| `wt env materialize\|show\|get\|copy` | Declarative env plane (`[env]` manifest): render seed + `${slug}`/`${port.<role>}`/`${env.<KEY>}`/`${db_name}`/`${db.<name>.<field>}` values, resolve the effective chain, read one key, or copy env from main into a slot. |
+| `wt check [--name NAME] [--json]` | Run the declarative `[[check]]` health probes (one named probe with `--name`) plus a database preflight (`db:<name>`); exit 1 when any fails. |
+| `wt teardown [--json]` | Canonical teardown for a worktree: stop processes → db snapshot → archive paths → db drop → release ports → clear claim (best-effort; always exits 0). |
 | `wt assert --mode main\|slot\|task` | Assert the current worktree's mode (exit 3 on mismatch) so hooks can guard where they run. |
 | `wt switch <branch>` | Switch this worktree's branch; creates new branches from the configured main branch. Refuses to switch a *linked* worktree to the main branch. |
 | `wt list` | Show all worktrees (main + linked) with branch and clean/dirty state. |
@@ -175,6 +176,16 @@ copy_from_main = [".env.development", ".env.development.local"]
 PORT = "${port.gateway}"
 CORS_ORIGINS = "http://localhost:${port.web}"
 
+[[db]]                                  # optional database lifecycle (`wt db`)
+name = "default"
+dialect = "postgres"                    # postgres | sqlite
+db_name = "loom_${db_slug}"             # ${db_slug} is identifier-safe
+url = "postgresql://localhost:5432/${db_name}"
+create = ["createdb ${db_name}"]
+migrate = []                            # empty = project-owned (clean no-op)
+backup = ["pg_dump -Fc -f ${archive}/${db_name}.dump ${db_name}"]
+drop = ["dropdb --if-exists ${db_name}"]
+
 [[check]]                               # optional declarative health probes (`wt check`)
 name = "api"
 url = "http://localhost:${port.gateway}/api/v1/models"
@@ -191,7 +202,8 @@ Defaults: `main_branch=develop`, `worktree.base=../worktrees`,
 `merge.strategy=no-ff`, `merge.remote=origin`, `merge.push=true`,
 `merge.log=20`, `commit.agent=` (auto-detect pi → claude), `commit.model=`,
 `commit.push=false`, `task.branch_pattern=${type}/${slug}`, `task.types=[task]`,
-`task.archive_budget=60`, `task.archive_max_bytes=26214400`.
+`task.archive_budget=60`, `task.archive_max_bytes=26214400`. `[env]`,
+`[[check]]`, `[proc]`, and `[[db]]` are opt-in (absent = inactive).
 
 Supported placeholders in patterns: `${project_name}`, `${slot}`. Unknown
 placeholders are an error.
@@ -215,10 +227,140 @@ exits non-zero; a failing teardown hook is a warning and `wt remove` continues.
 
 - `scripts/wt/hooks.sh` — dispatches on `WT_HOOK`; task worktrees `wt claim
   register` + `wt env materialize`, slot worktrees `wt env copy --from-main`
-  (both env steps guarded by `wt config has env`); teardown runs `wt teardown`.
+  (both env steps guarded by `wt config has env`); when the project declares
+  `[[db]]`, setup also runs `wt db create`; teardown runs `wt teardown`.
 - `scripts/wt/extra.sh` — the project escape hatch, called with `setup` or
   `teardown`; put irreducible project-specific steps here. The generated files
   contain no project assumptions and are never overwritten without `--force`.
+
+### Database lifecycle (`[[db]]` and `wt db`)
+
+A `[[db]]` block is a **dialect-agnostic command manifest**: the project
+declares the commands, and `wt` owns the lifecycle (ordering, `${slug}` /
+`${db_name}` / `${archive}` substitution, idempotency, existence/version
+probes, the drop guard, and best-effort teardown). No SQL lives in `wt`, so the
+same shape works for local PostgreSQL client tools, a project's bundled
+`loom-db` binary, or SQLite.
+
+```toml
+[[db]]
+name    = "default"             # --name selector; default "default"
+dialect = "postgres"            # postgres | sqlite
+scope   = "database"           # database (one DB per worktree) | schema (shared DB)
+db_name = "loom_${db_slug}"     # ${db_slug} = identifier-safe slug
+url     = "postgresql://localhost:5432/${db_name}"
+# Optional connection overrides (ambient PGHOST/PGPORT/PGUSER otherwise):
+# host = "localhost"
+# port = 5432
+# user = "postgres"
+# maintenance_db = "postgres"   # database used for preflight/existence checks
+# database = "loom"             # required for scope = "schema"
+# min_version = 14              # server_version_num gate (default 14)
+# Optional probe overrides (for a bundled client such as loom-db):
+# ping    = ["loom-db ping"]
+# version = ["loom-db server-version-num"]
+# exists  = ["loom-db database-exists ${db_name}"]
+create  = ["createdb ${db_name}"]
+migrate = []                    # empty = project-owned; wt migrate is a clean no-op
+backup  = ["pg_dump -Fc -f ${archive}/${db_name}.dump ${db_name}"]
+drop    = ["dropdb --if-exists ${db_name}"]
+```
+
+Each command is **one shell command line**, executed in order from the
+worktree root. Available placeholders: `${slug}`, `${db_slug}` (safe
+identifier), `${db_name}`, `${archive}` (the teardown snapshot dir),
+`${port.<role>}`, `${env.<KEY>}`, and `${db.<name>.<field>}`. The same values
+are exported to commands as `WT_DB_NAME`, `WT_DB_SLUG`, and `WT_DB_ARCHIVE`.
+
+Lifecycle rules enforced by `wt` (not by the declared command):
+
+- **Idempotent create.** `wt db create` probes existence first (`exists`, then
+  `pg_database`/`pg_namespace` for postgres, or file non-empty for sqlite) and
+  skips an existing target, so `createdb`/`CREATE DATABASE` need not be
+  idempotent.
+- **Only drop our own name.** `db_name` must contain `${slug}` or `${db_slug}`
+  when `drop` is declared; every `drop` command line must reference
+  `${db_name}`/`${db_slug}` (or `$WT_DB_NAME`/`$WT_DB_SLUG`) so a hardcoded name
+  cannot bypass the guard; the resolved name must be a safe identifier/path
+  (no wildcards, quotes, or traversal) and must still contain this worktree's
+  slug. `wt db create` records the exact created name under `.wt/db/<name>`;
+  a later branch rename or template change makes `drop` refuse.
+- **Never drop from main.** `wt db drop` refuses the main checkout, so a
+  teardown there can never remove the shared/main database.
+- **Best-effort teardown.** `wt teardown` runs snapshot (`db backup`) then
+  `db drop`; failures are reported but teardown still exits 0.
+- **Preflight.** For postgres, `wt db create|migrate`, `wt check`, and
+  `wt doctor` verify reachability and `server_version_num >= min_version`
+  (default 14) before doing work.
+
+Isolation is a **config choice, not a code fork**:
+
+```toml
+# One database per worktree
+[[db]]
+name = "default"
+dialect = "postgres"
+scope = "database"
+db_name = "loom_${db_slug}"
+create = ["createdb ${db_name}"]
+drop = ["psql postgres -qc \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${db_name}'\"", "dropdb --if-exists ${db_name}"]
+
+# One schema per worktree in a shared database (no CREATE/DROP DATABASE).
+[[db]]
+name = "default"
+dialect = "postgres"
+scope = "schema"
+database = "loom"
+db_name = "loom_${db_slug}"
+create = ["psql loom -qc 'CREATE SCHEMA IF NOT EXISTS ${db_name}'"]
+drop = ["psql loom -qc 'DROP SCHEMA IF EXISTS ${db_name} CASCADE'"]
+
+# SQLite keeps the classic file-based shape.
+[[db]]
+name = "default"
+dialect = "sqlite"
+db_name = "data/loom.${slug}.sqlite"
+create = ["mkdir -p data && touch ${db_name}"]
+drop = ["rm -f ${db_name}"]
+```
+
+An `[env.<app>]` can bind to a block (`db = "default"`) and use `${db_name}`
+or `${db.default.url}` in its `[env.<app>.values]` for connection strings:
+
+```toml
+[env.api]
+dir = "apps/api"
+gen = ".env.local"
+db = "default"
+[env.api.values]
+DATABASE_URL = "${db.default.url}"
+```
+
+### Adopting `[[db]]` in a consuming project (Loom/R2.0a delta)
+
+Everything below lives in the **consuming repo**; `wt` itself stays
+project-agnostic. The migration from the SQLite file shape is a config/hook
+delta, not a `wt` code change:
+
+- `.wt.toml`: replace `[env.api.values].DB_PATH` with a `[[db]]` block and a
+  derived connection string (`DATABASE_URL = "${db.default.url}"`). Remove the
+  `file`/`nonempty` `[[check]] database` probe (the `db:default` preflight and
+  the app's `/health` probe replace it). Remove `data` from
+  `[task].archive_paths`; `wt teardown` snapshots the PG database through
+  `wt db backup`.
+- `dev/orca/setup.sh`: add `wt db create` (and, only if truly lifecycle-tied,
+  `wt db migrate`); keep the hook thin — no SQL/psql logic belongs there.
+- `dev/orca/teardown.sh`: unchanged; `wt teardown` now includes the best-effort
+  snapshot + own-name drop.
+- `dev/extra.sh`: drop `mkdir -p data/`; a PG reachability check is
+  `wt check`/`wt doctor` (or `wt db status` after create).
+- The drop guard keys off the same claim/branch slug `wt` already owns:
+  `db_name` **must** contain `${slug}` or `${db_slug}`, and the main checkout is
+  never dropped. If the project's dev PG account cannot `CREATE/DROP DATABASE`,
+  use `scope = "schema"` with a shared `database` instead of forking the code.
+- If the project uses its bundled `loom-db` binary instead of client tools,
+  declare `ping`, `version` (must print `server_version_num`, e.g. `160002`),
+  and `exists` command arrays; `create`/`migrate`/`backup`/`drop` are unchanged.
 
 ## Safety model
 
@@ -241,6 +383,8 @@ exits non-zero; a failing teardown hook is a warning and `wt remove` continues.
 - `WT_COMMIT_TIMEOUT` — seconds per coding-agent call for `wt commit` (default 300).
 - `WT_COMMIT_CONTEXT_LIMIT` / `WT_COMMIT_FILE_CAP` — caps for the change context handed to the agent (default 204800 / 65536).
 - `WT_STATE_DIR` — user-level state root for the task-mode port registry and archive (default `~/.wt`).
+- `WT_DB_CONNECT_TIMEOUT` — seconds for the default `psql` reachability/version probes (default 5).
+- `WT_CHECK_TIMEOUT` / `WT_PROC_WAIT_TIMEOUT` — per-probe timeout for `wt check` (default 3) and per-role wait for `wt proc start` (default 60).
 
 ## The current repository
 

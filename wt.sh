@@ -245,6 +245,7 @@ validate_config() {
     validate_task_config
     validate_check_config
     validate_proc_config
+    validate_db_config
 }
 
 # ----------------------------------------------------------------------------
@@ -982,6 +983,159 @@ cfg_env_value() {
     yq -r ".env.\"$app\".values.\"$key\" // \"\"" "$(config_file)" 2>/dev/null || true
 }
 
+# ----------------------------------------------------------------------------
+# [[db]] manifest -- optional, dialect-agnostic database lifecycle.
+#
+# wt owns *when* create/migrate/backup/drop run, ${slug}/${db_name}
+# substitution, idempotency, the only-drop-our-own-name guard and best-effort
+# teardown. The project declares the actual commands, so wt contains no SQL and
+# the same manifest works for postgres, sqlite, or a bundled CLI (loom-db).
+# ----------------------------------------------------------------------------
+
+# cfg_db_count: number of [[db]] blocks (0 when none).
+cfg_db_count() {
+    if ! config_present; then printf '0'; return; fi
+    yq -r '.db // [] | length' "$(config_file)" 2>/dev/null || printf '0'
+}
+
+# cfg_db_present: true when at least one [[db]] block is declared.
+cfg_db_present() {
+    local n
+    n="$(cfg_db_count)"
+    [ "${n:-0}" -gt 0 ] 2>/dev/null
+}
+
+# cfg_db_field IDX FIELD: scalar field of the IDX-th [[db]] ("" when unset).
+cfg_db_field() {
+    local i="$1" f="$2"
+    config_present || return 0
+    yq -r ".db[$i].\"$f\" // \"\"" "$(config_file)" 2>/dev/null || true
+}
+
+# cfg_db_type IDX FIELD: TOML type of a [[db]] field ("!!null" when unset).
+cfg_db_type() {
+    local i="$1" f="$2"
+    config_present || return 0
+    yq -r ".db[$i].\"$f\" | type" "$(config_file)" 2>/dev/null || true
+}
+
+# cfg_db_list IDX FIELD: newline list from an array field (scalars yield "").
+cfg_db_list() {
+    local i="$1" f="$2"
+    config_present || return 0
+    yq -r ".db[$i].\"$f\" // [] | .[]" "$(config_file)" 2>/dev/null | sed '/^$/d'
+}
+
+# db_name_at IDX: the manifest name of the IDX-th [[db]] (default "default").
+db_name_at() {
+    local n
+    n="$(cfg_db_field "$1" name)"
+    [ -n "$n" ] || n="default"
+    printf '%s' "$n"
+}
+
+# db_names: newline list of [[db]] manifest names (declaration order).
+db_names() {
+    local n i=0
+    n="$(cfg_db_count)"
+    while [ "$i" -lt "${n:-0}" ]; do
+        db_name_at "$i"
+        i=$((i + 1))
+    done
+}
+
+# db_index_by_name NAME: 0-based index of the [[db]] named NAME; 1 when absent.
+db_index_by_name() {
+    local want="$1" n i=0
+    n="$(cfg_db_count)"
+    while [ "$i" -lt "${n:-0}" ]; do
+        if [ "$(db_name_at "$i")" = "$want" ]; then
+            printf '%s\n' "$i"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# db_require_present: clean error when the project has no [[db]] block.
+db_require_present() {
+    cfg_db_present || die "no [[db]] block declared in $(config_file); wt db is inactive for this project"
+}
+
+# db_assert_name NAME: validate a --name filter against declared blocks.
+db_assert_name() {
+    db_index_by_name "$1" >/dev/null \
+        || die "db: unknown --name '$1' (declared: $(db_names | tr '\n' ' ' | sed 's/ $//'))"
+}
+
+# cfg_env_db APP: the [[db]] manifest name bound to an [env.<app>] ("" when
+# unset). Binding is only needed when the env plane references ${db...}.
+cfg_env_db() {
+    local app="$1" d
+    d="$(cfg_env_field "$app" db)"
+    if [ -z "$d" ]; then
+        # A single [[db]] block is unambiguous; more than one needs an app
+        # binding (or an explicit ${db.<name>.<field>}).
+        if [ "$(cfg_db_count)" = "1" ] 2>/dev/null; then
+            d="$(db_name_at 0)"
+        fi
+    fi
+    printf '%s' "$d"
+}
+
+# db_slug SLUG: slug made safe for an unquoted SQL identifier (lower-case,
+# non-alphanumerics collapsed to '_', never starting with a digit).
+db_slug() {
+    local s
+    s="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_' | sed 's/^_*//; s/_*$//')"
+    [ -n "$s" ] || s="x"
+    case "$s" in
+        [0-9]*) s="_$s" ;;
+    esac
+    printf '%s' "$s"
+}
+
+# db_safe_ident NAME: a postgres database/schema name wt is willing to drop.
+# Deliberately excludes SQL wildcards, quotes, whitespace, and shell
+# metacharacters so a substituted slug can never widen the target.
+db_safe_ident() {
+    case "$1" in
+        ''|[!A-Za-z_]*) return 1 ;;
+    esac
+    case "$1" in
+        *[!A-Za-z0-9_-]*) return 1 ;;
+    esac
+    return 0
+}
+
+# db_safe_path NAME: a relative sqlite path wt is willing to drop. Rejects
+# absolute paths, '..' traversal, and glob wildcards.
+db_safe_path() {
+    case "$1" in
+        ''|/*|*/|*..*|*[!A-Za-z0-9._/-]*) return 1 ;;
+    esac
+    return 0
+}
+
+# db_safe_name DIALECT NAME: dialect-specific safety for a resolved db_name.
+db_safe_name() {
+    case "$1" in
+        sqlite) db_safe_path "$2" ;;
+        *)      db_safe_ident "$2" ;;
+    esac
+}
+
+# db_template_is_own TEMPLATE: true when the declared db_name template is
+# tied to this worktree's own slug. This is the first half of the drop guard:
+# a block cannot declare a shared/fixed name and then ask wt to drop it.
+db_template_is_own() {
+    case "$1" in
+        *'${slug}'*|*'${db_slug}'*) return 0 ;;
+    esac
+    return 1
+}
+
 # cfg_check_count: number of [[check]] probes (0 when none).
 cfg_check_count() {
     if ! config_present; then printf '0'; return; fi
@@ -1193,6 +1347,126 @@ validate_proc_config() {
     done
 }
 
+# validate_db_config: [[db]] blocks are declarative command manifests. wt owns
+# the lifecycle, so the shape is validated here once instead of failing
+# halfway through a teardown.
+validate_db_config() {
+    local n i=0 name dialect dbtmpl scope minv f t
+    if config_present; then
+        case "$(yq -r '.db | type' "$(config_file)" 2>/dev/null || true)" in
+            ''|'!!null'|'!!seq') ;;
+            *) die "configuration error: db must be an array of tables (use [[db]], not [db])" ;;
+        esac
+    fi
+    n="$(cfg_db_count)"
+    [ "${n:-0}" -gt 0 ] 2>/dev/null || {
+        # An [env.<app>].db binding without a [[db]] block is a typo, not a
+        # harmless default.
+        local app
+        for app in $(cfg_env_apps); do
+            [ -z "$(cfg_env_field "$app" db)" ] \
+                || die "configuration error: env.$app.db names a database but no [[db]] blocks are declared"
+        done
+        return 0
+    }
+    while [ "$i" -lt "$n" ]; do
+        name="$(db_name_at "$i")"
+        valid_role_name "$name" \
+            || die "configuration error: invalid [[db]] name '$name' (want ^[a-z][a-z0-9_-]*$)"
+        dialect="$(cfg_db_field "$i" dialect)"
+        case "$dialect" in
+            postgres|sqlite) ;;
+            '') die "configuration error: db.$name.dialect is required (postgres|sqlite)" ;;
+            *)  die "configuration error: db.$name.dialect '$dialect' is unsupported (use postgres or sqlite)" ;;
+        esac
+        dbtmpl="$(cfg_db_field "$i" db_name)"
+        [ -n "$dbtmpl" ] \
+            || die "configuration error: db.$name.db_name is required"
+        case "$dbtmpl" in
+            *'${db_name}'*) die "configuration error: db.$name.db_name must not reference \${db_name} (self-recursive)" ;;
+        esac
+        scope="$(cfg_db_field "$i" scope)"
+        case "$scope" in
+            ''|database|schema) ;;
+            *) die "configuration error: db.$name.scope '$scope' is unsupported (database|schema)" ;;
+        esac
+        if [ "$scope" = "schema" ] && [ "$dialect" = "postgres" ]; then
+            [ -n "$(cfg_db_field "$i" database)" ] \
+                || die "configuration error: db.$name uses scope = \"schema\" but has no database (the shared database to connect to)"
+        fi
+        minv="$(cfg_db_field "$i" min_version)"
+        if [ -n "$minv" ]; then
+            case "$minv" in
+                *[!0-9]*) die "configuration error: db.$name.min_version '$minv' must be a positive integer" ;;
+            esac
+        fi
+        # Commands are arrays of shell command lines. A scalar would be a
+        # silent no-op with yq's .[], so reject it explicitly.
+        for f in create migrate backup drop exists ping version; do
+            t="$(cfg_db_type "$i" "$f")"
+            case "$t" in
+                ''|'!!null') ;;
+                '!!seq') ;;
+                *) die "configuration error: db.$name.$f must be an array of command lines (got $t)" ;;
+            esac
+            # Reject empty array elements: an empty shell line is a no-op that
+            # hides a broken manifest.
+            local line
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                case "$line" in
+                    *[![:space:]]*) ;;
+                    *) die "configuration error: db.$name.$f contains an empty command" ;;
+                esac
+                # A drop command must consume the resolved, guarded db_name.
+                # Otherwise a hardcoded name would defeat the only-drop-our-own
+                # guard even though wt checked the template.
+                if [ "$f" = "drop" ]; then
+                    case "$line" in
+                        *'${db_name}'*|*'${db_slug}'*|*WT_DB_NAME*|*WT_DB_SLUG*) ;;
+                        *) die "configuration error: db.$name.drop must reference \${db_name}/\${db_slug} or \$WT_DB_NAME/\$WT_DB_SLUG (got: $line)" ;;
+                    esac
+                fi
+            done < <(cfg_db_list "$i" "$f")
+        done
+        # The create/drop pair is what makes wt own the lifecycle. Both are
+        # optional so a read-only or project-managed db can be declared, but a
+        # drop requires a name tied to this worktree's slug (the drop guard).
+        if [ "$(db_cmd_count "$i" drop)" -gt 0 ] && ! db_template_is_own "$dbtmpl"; then
+            die "configuration error: db.$name.db_name must contain \${slug} or \${db_slug} when drop is declared (refusing a fixed/shared name)"
+        fi
+        i=$((i + 1))
+    done
+    # Duplicate manifest names would make --name ambiguous and the record file
+    # for one block overwrite the other.
+    local dup
+    dup="$(db_names | sort | uniq -d | sed -n '1p')"
+    [ -z "$dup" ] || die "configuration error: duplicate [[db]] name '$dup' in $(config_file)"
+    # [env.<app>].db must name a declared block, and the shorthand ${db_name}
+    # needs a binding when more than one db exists (otherwise it would be left
+    # as a literal in the generated env file).
+    local app bind key raw
+    for app in $(cfg_env_apps); do
+        bind="$(cfg_env_field "$app" db)"
+        if [ -n "$bind" ]; then
+            db_index_by_name "$bind" >/dev/null \
+                || die "configuration error: env.$app.db '$bind' matches no [[db]] name in $(config_file)"
+        fi
+        if [ -z "$(cfg_env_db "$app")" ]; then
+            while IFS= read -r key; do
+                [ -n "$key" ] || continue
+                raw="$(cfg_env_value "$app" "$key")"
+                case "$raw" in
+                    *'${db_name}'*)
+                        die "configuration error: env.$app.values.$key uses \${db_name} but env.$app.db is unset and multiple [[db]] blocks exist (bind one or use \${db.<name>.db_name})"
+                        ;;
+                esac
+            done < <(cfg_env_value_keys "$app")
+        fi
+    done
+    return 0
+}
+
 # ----------------------------------------------------------------------------
 # Task branch <-> slug/type helpers
 # ----------------------------------------------------------------------------
@@ -1363,8 +1637,9 @@ Toolkit (flow-agnostic; callable from any worktree or an external orchestrator)
   wt proc stop --cwd DIR            stop processes whose cwd is inside DIR
   wt archive --slug S --path P...   snapshot paths for a worktree
   wt env materialize|show|get|copy  declarative env plane ([env] manifest)
-  wt check [--name NAME] [--json]   run declarative health probes ([[check]])
-  wt teardown [--json]              canonical teardown (stop,archive,release,clear)
+  wt db create|migrate|backup|status|drop  declarative database lifecycle ([[db]])
+  wt check [--name NAME] [--json]   run declarative health probes ([[check]]) + db preflight
+  wt teardown [--json]              canonical teardown (stop,snapshot,drop,release,clear)
   wt assert --mode main|slot|task   assert the current worktree's mode
 
 Lifecycle helpers
@@ -1415,18 +1690,26 @@ CONFIG (.wt.toml, committed to Git, read from the main worktree)
   task.archive_budget    wt archive default time budget in seconds (default 60)
   task.archive_max_bytes wt archive per-file size cap in bytes (default 26214400)
   [env.<app>]            optional env plane: dir, files, seed, seed_target, gen,
-                         copy_from_main, and a [env.<app>.values] map using
-                         ${slug} / ${port.<role>} / ${env.<KEY>}
+                         copy_from_main, db (bind a [[db]]), and a
+                         [env.<app>.values] map using ${slug} / ${port.<role>} /
+                         ${env.<KEY>} / ${db_name} / ${db.<name>.<field>}
   [[check]]              optional health probe: name + (url[+expect] | file[+nonempty])
   [proc.<role>]          optional process plane for wt proc start: dir (relative,
                          inside the worktree), cmd, and the name of the url
                          [[check]] probe (the role's health endpoint)
+  [[db]]                 optional database lifecycle: name, dialect, scope,
+                         db_name, url, create/migrate/backup/drop command
+                         arrays; placeholders ${slug}, ${db_slug}, ${db_name},
+                         ${archive}, ${port.<role>}, ${env.<KEY>},
+                         ${db.<name>.<field>}. drop is refused unless db_name
+                         contains ${slug}/${db_slug}; main never drops.
 
 ENVIRONMENT
   WT_LOCK_TIMEOUT        seconds to wait for the project lock (default 60)
   WT_STATE_DIR           user-level state dir (default ~/.wt; ports, archive, locks)
   WT_CHECK_TIMEOUT       seconds per wt check probe (default 3)
   WT_PROC_WAIT_TIMEOUT   seconds wt proc start waits for a role's probe (default 60)
+  WT_DB_CONNECT_TIMEOUT  seconds for default psql db probes (default 5)
 
 HOOK ENVIRONMENT (hooks.setup / hooks.teardown)
   WT_MAIN_WORKTREE WT_WORKTREE WT_SLOT WT_BRANCH WT_PROJECT_NAME
@@ -1441,6 +1724,10 @@ cmd_version() {
 
 cmd_doctor() {
     local ok=true
+    # cmd_doctor is usable outside require_project (it reports a missing repo as
+    # a failed check), but db probes need a worktree root for declared command
+    # cwd and --name lookups.
+    WT_CURRENT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
     check() {
         if [ "$1" ]; then printf '✓ %s\n' "$2"; else
             printf '✗ %s\n' "$2"
@@ -1485,6 +1772,21 @@ cmd_doctor() {
         if cfg_proc_present; then check 1 "process plane configured ($(cfg_proc_roles | tr '\n' ' '))"; fi
         nchk="$(cfg_check_count)"
         if [ "${nchk:-0}" -gt 0 ] 2>/dev/null; then check 1 "health checks declared ($nchk)"; fi
+        if cfg_db_present; then
+            check 1 "database plane configured ($(db_names | tr '\n' ' '))"
+            local dbidx dbname dbslug dbports
+            dbslug="$(env_current_slug)"
+            dbports="$(env_current_ports)"
+            while IFS= read -r dbidx; do
+                [ -n "$dbidx" ] || continue
+                dbname="$(db_name_at "$dbidx")"
+                if db_probe "$dbidx" "$dbslug" "$dbports"; then
+                    check 1 "db.$dbname: $DB_PROBE_DETAIL"
+                else
+                    check "" "db.$dbname: $DB_PROBE_DETAIL"
+                fi
+            done < <(db_indices "")
+        fi
     fi
 
     if git rev-parse --git-dir >/dev/null 2>&1; then
@@ -3368,35 +3670,109 @@ env_key_from_file() {
     printf '%s' "$val"
 }
 
-# env_expand_str VALUE SLUG PORTS APP [DEPTH]: expand the three placeholder
-# classes (${slug}, ${port.<role>}, ${env.<KEY>}). ${env.<KEY>} resolves against
-# the same app's declared values, bounded by DEPTH.
-env_expand_str() {
-    local val="$1" slug="$2" ports="$3" app="$4" depth="${5:-0}" r p inner key sub
+# db_resolve_name NAME SLUG PORTS [APP] [ARCHIVE] [DEPTH]: expand a [[db]]
+# db_name template. ${db_name} is not available here (validated as
+# self-recursive).
+db_resolve_name() {
+    local name="$1" slug="$2" ports="$3" app="${4:-}" archive="${5:-}" depth="${6:-0}"
+    local idx raw
+    idx="$(db_index_by_name "$name")" || return 1
+    raw="$(cfg_db_field "$idx" db_name)"
+    db_expand_str "$raw" "$slug" "$ports" "$app" "" "$archive" "$depth"
+}
+
+# db_resolve_field NAME FIELD SLUG PORTS [APP] [ARCHIVE] [DEPTH]: expand one
+# scalar [[db]] field. Used by both the env plane (${db.<name>.<field>}) and
+# the lifecycle commands (${db_name}, ${env.<KEY>}, ...).
+db_resolve_field() {
+    local name="$1" field="$2" slug="$3" ports="$4" app="${5:-}" archive="${6:-}" depth="${7:-0}"
+    local idx raw own=""
+    case "$field" in
+        name|dialect|scope|db_name|database|host|port|user|url|maintenance_db|min_version|nonempty)
+            ;;
+        *) return 1 ;;
+    esac
+    idx="$(db_index_by_name "$name")" || return 1
+    raw="$(cfg_db_field "$idx" "$field")"
+    [ -n "$raw" ] || return 1
+    if [ "$field" != "db_name" ]; then
+        own="$(db_resolve_name "$name" "$slug" "$ports" "$app" "$archive" $((depth + 1)) 2>/dev/null || true)"
+    fi
+    db_expand_str "$raw" "$slug" "$ports" "$app" "$own" "$archive" "$depth"
+}
+
+# db_expand_str VALUE SLUG PORTS APP RESOLVED_DB_NAME ARCHIVE [DEPTH]: expand
+# the placeholder classes a [[db]] block may use:
+#   ${slug} ${db_slug} ${db_name} ${archive} ${port.<role>}
+#   ${env.<KEY>} ${db.<name>.<field>} ${db.<field>}
+# Bounded by DEPTH so a ${env.X} <-> ${db.default.url} cycle terminates.
+db_expand_str() {
+    local val="$1" slug="$2" ports="$3" app="$4" own="$5" archive="$6" depth="${7:-0}"
+    local r p inner token dname field sub dbslug before guard
+    dbslug="$(db_slug "$slug")"
     val="${val//\$\{slug\}/$slug}"
+    val="${val//\$\{db_slug\}/$dbslug}"
+    [ -n "$own" ] && val="${val//\$\{db_name\}/$own}"
+    [ -n "$archive" ] && val="${val//\$\{archive\}/$archive}"
     while IFS=$'\t' read -r r p; do
         [ -n "$r" ] || continue
         val="${val//\$\{port.$r\}/$p}"
     done <<< "$ports"
     [ "$depth" -lt 10 ] || { printf '%s' "$val"; return 0; }
-    while :; do
-        case "$val" in
-            *'${env.'*) ;;
-            *) break ;;
-        esac
-        inner="${val#*\$\{env.}"
-        case "$inner" in
-            *'}'*) ;;
-            # malformed placeholder: no closing brace, so it can never
-            # resolve -- leave the value as-is instead of looping forever
-            *) break ;;
-        esac
-        key="${inner%%\}*}"
-        [ -n "$key" ] || break
-        sub="$(env_value_resolved "$app" "$key" "$slug" "$ports" $((depth + 1)) 2>/dev/null || true)"
-        val="${val//\$\{env.$key\}/$sub}"
+    guard=0
+    while [ "$guard" -lt 30 ]; do
+        guard=$((guard + 1))
+        before="$val"
+        # ${db.<name>.<field>} / ${db.<field>}
+        while :; do
+            case "$val" in *'${db.'*) ;; *) break ;; esac
+            inner="${val#*\$\{db.}"
+            case "$inner" in *'}'*) ;; *) break ;; esac
+            token="${inner%%\}*}"
+            [ -n "$token" ] || break
+            case "$token" in
+                *.*) dname="${token%%.*}"; field="${token#*.}" ;;
+                *)   dname="$(cfg_env_db "$app")"; field="$token" ;;
+            esac
+            [ -n "$dname" ] || break
+            sub="$(db_resolve_field "$dname" "$field" "$slug" "$ports" "$app" "$archive" $((depth + 1)) 2>/dev/null || true)"
+            local ph="\$\{db.$token\}"
+            if [ "$sub" = "$ph" ]; then break; fi
+            val="${val//\$\{db.$token\}/$sub}"
+            [ "$val" = "$before" ] && break
+            before="$val"
+        done
+        # ${env.<KEY>}
+        while :; do
+            case "$val" in *'${env.'*) ;; *) break ;; esac
+            inner="${val#*\$\{env.}"
+            case "$inner" in *'}'*) ;; *) break ;; esac
+            token="${inner%%\}*}"
+            [ -n "$token" ] || break
+            sub="$(env_value_resolved "$app" "$token" "$slug" "$ports" $((depth + 1)) 2>/dev/null || true)"
+            local eph="\$\{env.$token\}"
+            if [ "$sub" = "$eph" ]; then break; fi
+            val="${val//\$\{env.$token\}/$sub}"
+            [ "$val" = "$before" ] && break
+            before="$val"
+        done
+        [ "$val" = "$before" ] && break
     done
     printf '%s' "$val"
+}
+
+# env_expand_str VALUE SLUG PORTS APP [DEPTH]: expand the placeholder classes
+# an [env.<app>.values] entry may use: ${slug}, ${port.<role>}, ${env.<KEY>},
+# plus the db-plane forms ${db_name}, ${db.<name>.<field>} and ${db.<field>}.
+env_expand_str() {
+    local val="$1" slug="$2" ports="$3" app="$4" depth="${5:-0}" own="" bind
+    if cfg_db_present; then
+        bind="$(cfg_env_db "$app")"
+        if [ -n "$bind" ]; then
+            own="$(db_resolve_name "$bind" "$slug" "$ports" "$app" "" "$depth" 2>/dev/null || true)"
+        fi
+    fi
+    db_expand_str "$val" "$slug" "$ports" "$app" "$own" "" "$depth"
 }
 
 # env_value_resolved APP KEY SLUG PORTS [DEPTH]: expand a declared value.
@@ -3632,6 +4008,777 @@ cmd_env_copy() {
 }
 
 # ============================================================================
+# wt db -- declarative database lifecycle ([[db]] manifest)
+#
+# The project declares shell command lines; wt owns ordering, ${slug} /
+# ${db_name} / ${archive} substitution, idempotent create, existence probing,
+# the only-drop-our-own-name guard and best-effort teardown. No SQL lives in
+# wt's own code: even the default postgres probes are just psql invocations
+# that a project can override with ping/version/exists commands (e.g. loom-db).
+# ============================================================================
+
+# db_archive_dir SLUG: the same snapshot root `wt archive` uses.
+db_archive_dir() {
+    local slug="$1"
+    printf '%s/archive/%s/%s' "$(wt_state_dir)" "$(project_key)" "$slug"
+}
+
+# db_indices [NAME]: emit selected [[db]] indices (all when NAME is empty).
+db_indices() {
+    local name="${1:-}" n i=0
+    if [ -n "$name" ]; then
+        db_index_by_name "$name" || return 1
+        return 0
+    fi
+    n="$(cfg_db_count)"
+    while [ "$i" -lt "${n:-0}" ]; do
+        printf '%s\n' "$i"
+        i=$((i + 1))
+    done
+}
+
+# db_cmd_count IDX FIELD: number of declared command lines in FIELD.
+db_cmd_count() {
+    local i="$1" f="$2"
+    cfg_db_list "$i" "$f" | awk 'NF { n++ } END { print n + 0 }'
+}
+
+# db_app_for IDX: the [env] app whose ${env.<KEY>} values a [[db]] command
+# resolves against. Prefer an explicit [env.<app>].db binding, then a single
+# [env] app; with several unbound apps, ${env.<KEY>} is left unresolved and the
+# command reports it instead of guessing.
+db_app_for() {
+    local idx="$1" name a bind apps
+    name="$(db_name_at "$idx")"
+    for a in $(cfg_env_apps); do
+        bind="$(cfg_env_field "$a" db)"
+        if [ "$bind" = "$name" ]; then printf '%s' "$a"; return 0; fi
+    done
+    apps="$(cfg_env_apps)"
+    if [ "$(printf '%s\n' "$apps" | awk 'NF{n++} END{print n+0}')" = "1" ]; then
+        printf '%s' "$apps"
+    fi
+    return 0
+}
+
+# db_own_name IDX SLUG PORTS ARCHIVE: the resolved db_name for a command
+# context (with the app binding applied).
+db_own_name() {
+    local idx="$1" slug="$2" ports="$3" archive="$4" app
+    app="$(db_app_for "$idx")"
+    db_resolve_name "$(db_name_at "$idx")" "$slug" "$ports" "$app" "$archive" 0
+}
+
+# db_expand_cmd IDX FIELD LINE SLUG PORTS ARCHIVE: expand one declared command
+# line. Fails when a placeholder cannot be resolved, so wt never runs a
+# half-substituted command.
+db_expand_cmd() {
+    local idx="$1" field="$2" line="$3" slug="$4" ports="$5" archive="$6"
+    local name own out app
+    name="$(db_name_at "$idx")"
+    app="$(db_app_for "$idx")"
+    own="$(db_own_name "$idx" "$slug" "$ports" "$archive")" || return 1
+    out="$(db_expand_str "$line" "$slug" "$ports" "$app" "$own" "$archive" 0)"
+    case "$out" in
+        *'${'*)
+            note "db.$name.$field: unresolved placeholder in command: $out"
+            return 1
+            ;;
+    esac
+    printf '%s' "$out"
+}
+
+# db_run_field IDX FIELD SLUG PORTS ARCHIVE [BEST_EFFORT] [QUIET]: run every
+# declared command line in order. Returns the first failure; with BEST_EFFORT
+# it still stops the sequence but reports it as a warning.
+db_run_field() {
+    local idx="$1" field="$2" slug="$3" ports="$4" archive="$5"
+    local best="${6:-false}" quiet="${7:-false}" name line cmd rc=0 own dbslug
+    name="$(db_name_at "$idx")"
+    own="$(db_own_name "$idx" "$slug" "$ports" "$archive" 2>/dev/null || true)"
+    dbslug="$(db_slug "$slug")"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        if ! cmd="$(db_expand_cmd "$idx" "$field" "$line" "$slug" "$ports" "$archive")"; then
+            return 1
+        fi
+        if [ "$quiet" = "true" ]; then
+            ( cd "$WT_CURRENT_ROOT" && WT_DB_NAME="$own" \
+                WT_DB_SLUG="$dbslug" WT_DB_ARCHIVE="$archive" \
+                bash -c "$cmd" ) >/dev/null 2>&1 || rc=$?
+        else
+            ( cd "$WT_CURRENT_ROOT" && WT_DB_NAME="$own" \
+                WT_DB_SLUG="$dbslug" WT_DB_ARCHIVE="$archive" \
+                bash -c "$cmd" ) || rc=$?
+        fi
+        if [ "$rc" -ne 0 ]; then
+            if [ "$quiet" = "true" ]; then
+                : # probe commands are expected to fail (exists=false, unreachable)
+            elif [ "$best" = "true" ]; then
+                warn "db.$name.$field command failed (exit $rc): $cmd"
+            else
+                note "db.$name.$field command failed (exit $rc): $cmd"
+            fi
+            return "$rc"
+        fi
+    done < <(cfg_db_list "$idx" "$field")
+    return 0
+}
+
+# db_capture_field IDX FIELD SLUG PORTS ARCHIVE: run the commands and print
+# their combined stdout (used for declared `version` commands).
+db_capture_field() {
+    local idx="$1" field="$2" slug="$3" ports="$4" archive="$5"
+    local name line cmd out
+    name="$(db_name_at "$idx")"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        cmd="$(db_expand_cmd "$idx" "$field" "$line" "$slug" "$ports" "$archive")" || return 1
+        out="$( ( cd "$WT_CURRENT_ROOT" && bash -c "$cmd" ) 2>/dev/null )" || return 1
+        printf '%s\n' "$out"
+    done < <(cfg_db_list "$idx" "$field")
+    return 0
+}
+
+# db_parse_version VALUE: extract the first integer as a server_version_num.
+# `14`, `14.2` and `140000` all normalize to a comparable number.
+db_parse_version() {
+    local v
+    v="$(printf '%s' "$1" | grep -oE '[0-9]+' | sed -n '1p')" || true
+    [ -n "$v" ] || return 1
+    if [ "$v" -lt 1000 ] 2>/dev/null; then
+        v=$((v * 10000))
+    fi
+    printf '%s' "$v"
+}
+
+# db_min_version IDX: the configured minimum, normalized to server_version_num.
+db_min_version() {
+    local v
+    v="$(cfg_db_field "$1" min_version)"
+    [ -n "$v" ] || v=14
+    db_parse_version "$v"
+}
+
+# db_pg_query IDX DB SQL SLUG PORTS: run one psql query and print stdout.
+# Sets DB_PG_ERR on failure. Uses ambient libpq env (PGHOST/PGUSER/...) unless
+# the block declares host/port/user, so local defaults keep working.
+db_pg_query() {
+    local idx="$1" db="$2" sql="$3" slug="$4" ports="$5"
+    local name host port user errf out rc=0
+    DB_PG_ERR=""
+    command -v psql >/dev/null 2>&1 || {
+        DB_PG_ERR="psql not found (install the PostgreSQL client, or declare db.<name>.ping/version)"
+        return 127
+    }
+    name="$(db_name_at "$idx")"
+    host="$(db_resolve_field "$name" host "$slug" "$ports" "" "" 0 2>/dev/null || true)"
+    port="$(db_resolve_field "$name" port "$slug" "$ports" "" "" 0 2>/dev/null || true)"
+    user="$(db_resolve_field "$name" user "$slug" "$ports" "" "" 0 2>/dev/null || true)"
+    errf="$(mktemp "${TMPDIR:-/tmp}/wt-db-XXXXXX" 2>/dev/null || true)"
+    set -- -X -A -t -w -v ON_ERROR_STOP=1
+    [ -n "$host" ] && set -- "$@" -h "$host"
+    [ -n "$port" ] && set -- "$@" -p "$port"
+    [ -n "$user" ] && set -- "$@" -U "$user"
+    if [ -n "$errf" ]; then
+        out="$(PGCONNECT_TIMEOUT="${WT_DB_CONNECT_TIMEOUT:-5}" psql "$@" -d "$db" -c "$sql" 2>"$errf")" || rc=$?
+        DB_PG_ERR="$(cat "$errf" 2>/dev/null)"
+        rm -f "$errf"
+    else
+        out="$(PGCONNECT_TIMEOUT="${WT_DB_CONNECT_TIMEOUT:-5}" psql "$@" -d "$db" -c "$sql" 2>&1)" || rc=$?
+        [ "$rc" -eq 0 ] || DB_PG_ERR="$out"
+    fi
+    printf '%s' "$out"
+    return "$rc"
+}
+
+# db_pg_maintenance_db IDX SLUG PORTS: the database psql connects to for server
+# preflight and database-existence checks. An explicit maintenance_db wins; a
+# schema-scoped block otherwise defaults to its shared database (the account
+# may have no access to `postgres`), and a database-scoped block to `postgres`.
+db_pg_maintenance_db() {
+    local idx="$1" db shared
+    db="$(db_resolve_field "$(db_name_at "$idx")" maintenance_db "$2" "$3" "" "" 0 2>/dev/null || true)"
+    if [ -z "$db" ] && [ "$(cfg_db_field "$idx" scope)" = "schema" ]; then
+        shared="$(db_resolve_field "$(db_name_at "$idx")" database "$2" "$3" "" "" 0 2>/dev/null || true)"
+        db="$shared"
+    fi
+    [ -n "$db" ] || db="postgres"
+    printf '%s' "$db"
+}
+
+# db_pg_ping IDX SLUG PORTS: true when the server answers. Sets DB_PG_ERR.
+db_pg_ping() {
+    local idx="$1" slug="$2" ports="$3" db
+    DB_PG_ERR=""
+    if [ "$(db_cmd_count "$idx" ping)" -gt 0 ]; then
+        if db_run_field "$idx" ping "$slug" "$ports" "" false true; then
+            return 0
+        fi
+        DB_PG_ERR="declared ping command failed"
+        return 1
+    fi
+    db="$(db_pg_maintenance_db "$idx" "$slug" "$ports")"
+    db_pg_query "$idx" "$db" "SELECT 1" "$slug" "$ports" >/dev/null
+}
+
+# db_pg_version IDX SLUG PORTS: print server_version_num. Sets DB_PG_ERR.
+db_pg_version() {
+    local idx="$1" slug="$2" ports="$3" out db v
+    DB_PG_ERR=""
+    if [ "$(db_cmd_count "$idx" version)" -gt 0 ]; then
+        out="$(db_capture_field "$idx" version "$slug" "$ports" "")" || {
+            DB_PG_ERR="declared version command failed"
+            return 1
+        }
+    else
+        db="$(db_pg_maintenance_db "$idx" "$slug" "$ports")"
+        out="$(db_pg_query "$idx" "$db" "SELECT current_setting('server_version_num')" "$slug" "$ports")" || return 1
+    fi
+    v="$(db_parse_version "$out")" || {
+        DB_PG_ERR="could not parse server version from '$out'"
+        return 1
+    }
+    printf '%s' "$v"
+}
+
+# db_pg_preflight IDX SLUG PORTS: reachability + minimum version. This is what
+# makes setup fail early instead of halfway through a migration. Sets
+# DB_PG_DETAIL for status/check/doctor output.
+db_pg_preflight() {
+    local idx="$1" slug="$2" ports="$3" ver min name
+    DB_PG_DETAIL=""
+    name="$(db_name_at "$idx")"
+    case "$(cfg_db_field "$idx" dialect)" in
+        postgres) ;;
+        *) DB_PG_DETAIL="dialect $(cfg_db_field "$idx" dialect) (no server preflight)"; return 0 ;;
+    esac
+    if ! db_pg_ping "$idx" "$slug" "$ports"; then
+        DB_PG_DETAIL="PostgreSQL unreachable${DB_PG_ERR:+: $DB_PG_ERR}"
+        return 1
+    fi
+    if ! ver="$(db_pg_version "$idx" "$slug" "$ports")"; then
+        DB_PG_DETAIL="PostgreSQL reachable, but version query failed${DB_PG_ERR:+: $DB_PG_ERR}"
+        return 1
+    fi
+    min="$(db_min_version "$idx")"
+    if [ "$ver" -lt "$min" ]; then
+        DB_PG_DETAIL="PostgreSQL server_version_num $ver is too old (need >= $min; set db.$name.min_version to override)"
+        return 1
+    fi
+    DB_PG_DETAIL="PostgreSQL $ver"
+    return 0
+}
+
+# db_sqlite_path IDX SLUG PORTS: absolute path of a sqlite db_name.
+db_sqlite_path() {
+    local idx="$1" slug="$2" ports="$3" db
+    db="$(db_resolve_name "$(db_name_at "$idx")" "$slug" "$ports" "" "" 0)" || return 1
+    case "$db" in
+        /*) printf '%s' "$db" ;;
+        *)  printf '%s/%s' "$WT_CURRENT_ROOT" "$db" ;;
+    esac
+}
+
+# db_exists IDX SLUG PORTS: 0 exists, 1 absent, 2 unknown (probe unavailable).
+db_exists() {
+    local idx="$1" slug="$2" ports="$3" name dialect scope db out size nonempty
+    name="$(db_name_at "$idx")"
+    dialect="$(cfg_db_field "$idx" dialect)"
+    DB_DB_EXISTS_DETAIL=""
+    if [ "$(db_cmd_count "$idx" exists)" -gt 0 ]; then
+        if db_run_field "$idx" exists "$slug" "$ports" "" false true; then
+            DB_DB_EXISTS_DETAIL="declared exists command: present"
+            return 0
+        fi
+        DB_DB_EXISTS_DETAIL="declared exists command: absent"
+        return 1
+    fi
+    case "$dialect" in
+        sqlite)
+            db="$(db_resolve_name "$name" "$slug" "$ports" "" "" 0)" || return 2
+            DB_DB_EXISTS_DETAIL="$db"
+            [ -f "$WT_CURRENT_ROOT/$db" ] || return 1
+            nonempty="$(cfg_db_field "$idx" nonempty)"
+            [ "$nonempty" = "false" ] && return 0
+            size="$(wc -c < "$WT_CURRENT_ROOT/$db" 2>/dev/null | tr -d ' ')"
+            [ "${size:-0}" -gt 0 ] 2>/dev/null && return 0
+            return 1
+            ;;
+        postgres)
+            db="$(db_resolve_name "$name" "$slug" "$ports" "" "" 0)" || return 2
+            scope="$(cfg_db_field "$idx" scope)"
+            [ -n "$scope" ] || scope="database"
+            if [ "$scope" = "schema" ]; then
+                local shared
+                shared="$(db_resolve_field "$name" database "$slug" "$ports" "" "" 0 2>/dev/null || true)"
+                [ -n "$shared" ] || { DB_DB_EXISTS_DETAIL="no shared database declared"; return 2; }
+                out="$(db_pg_query "$idx" "$shared" "SELECT 1 FROM pg_namespace WHERE nspname = '$db'" "$slug" "$ports")" || {
+                    DB_DB_EXISTS_DETAIL="$DB_PG_ERR"
+                    return 2
+                }
+            else
+                out="$(db_pg_query "$idx" "$(db_pg_maintenance_db "$idx" "$slug" "$ports")" "SELECT 1 FROM pg_database WHERE datname = '$db'" "$slug" "$ports")" || {
+                    DB_DB_EXISTS_DETAIL="$DB_PG_ERR"
+                    return 2
+                }
+            fi
+            case "$out" in
+                *1*) DB_DB_EXISTS_DETAIL="$db (present)"; return 0 ;;
+                *)   DB_DB_EXISTS_DETAIL="$db (absent)"; return 1 ;;
+            esac
+            ;;
+    esac
+    DB_DB_EXISTS_DETAIL="dialect $dialect has no existence probe"
+    return 2
+}
+
+# db_probe IDX SLUG PORTS: health probe used by wt check/doctor. For postgres
+# this is reachability + version (setup must fail before a migration); for
+# sqlite it is file existence + nonempty. Sets DB_PROBE_DETAIL.
+db_probe() {
+    local idx="$1" slug="$2" ports="$3" dialect
+    dialect="$(cfg_db_field "$idx" dialect)"
+    DB_PROBE_DETAIL=""
+    case "$dialect" in
+        postgres)
+            db_pg_preflight "$idx" "$slug" "$ports" || { DB_PROBE_DETAIL="$DB_PG_DETAIL"; return 1; }
+            DB_PROBE_DETAIL="$DB_PG_DETAIL"
+            return 0
+            ;;
+        sqlite)
+            local rc=0
+            if db_exists "$idx" "$slug" "$ports"; then rc=0; else rc=$?; fi
+            case "$rc" in
+                0) DB_PROBE_DETAIL="$(db_sqlite_path "$idx" "$slug" "$ports") (present)"; return 0 ;;
+                1) DB_PROBE_DETAIL="$(db_sqlite_path "$idx" "$slug" "$ports") (absent/empty)"; return 1 ;;
+                *) DB_PROBE_DETAIL="$DB_DB_EXISTS_DETAIL"; return 1 ;;
+            esac
+            ;;
+    esac
+    DB_PROBE_DETAIL="unsupported dialect $dialect"
+    return 1
+}
+
+# db_record_file ROOT NAME: per-worktree create record (proves the exact name
+# wt created, so a later drop cannot be redirected by a branch rename or a
+# changed template).
+db_record_file() {
+    printf '%s/.wt/db/%s' "$1" "$2"
+}
+
+db_record_write() {
+    local root="$1" name="$2" slug="$3" db="$4" f
+    f="$(db_record_file "$root" "$name")"
+    mkdir -p "$(dirname "$f")" 2>/dev/null || return 1
+    {
+        printf 'slug=%s\n' "$slug"
+        printf 'db_name=%s\n' "$db"
+    } > "$f" 2>/dev/null || return 1
+    return 0
+}
+
+# db_record_read ROOT NAME: sets DB_REC_SLUG/DB_REC_NAME; 1 when absent.
+db_record_read() {
+    local root="$1" name="$2" f k v
+    DB_REC_SLUG=""
+    DB_REC_NAME=""
+    f="$(db_record_file "$root" "$name")"
+    [ -f "$f" ] || return 1
+    while IFS='=' read -r k v; do
+        case "$k" in
+            slug) DB_REC_SLUG="$v" ;;
+            db_name) DB_REC_NAME="$v" ;;
+        esac
+    done < "$f"
+    [ -n "$DB_REC_NAME" ]
+}
+
+db_record_remove() {
+    local root="$1" name="$2" f
+    f="$(db_record_file "$root" "$name")"
+    rm -f "$f" 2>/dev/null || true
+    rmdir "$(dirname "$f")" 2>/dev/null || true
+}
+
+# db_check_target IDX SLUG PORTS: resolve and validate the target name. Used by
+# create/backup/drop so an unsafe or untied name is rejected before any command
+# runs. Sets DB_TARGET_VALUE / DB_TARGET_ERR (globals survive the call; a
+# command substitution would run the function in a subshell and lose them).
+db_check_target() {
+    local idx="$1" slug="$2" ports="$3" name dialect tmpl db dbslug
+    name="$(db_name_at "$idx")"
+    dialect="$(cfg_db_field "$idx" dialect)"
+    tmpl="$(cfg_db_field "$idx" db_name)"
+    DB_TARGET_VALUE=""
+    DB_TARGET_ERR=""
+    [ -n "$slug" ] || { DB_TARGET_ERR="no slug (claim/branch) in $WT_CURRENT_ROOT"; return 1; }
+    [ -n "$tmpl" ] || { DB_TARGET_ERR="db.$name.db_name is empty"; return 1; }
+    db_resolve_name "$name" "$slug" "$ports" "" "" 0 >/dev/null 2>&1 || {
+        DB_TARGET_ERR="db.$name.db_name could not be expanded (slug '$slug')"
+        return 1
+    }
+    db="$(db_resolve_name "$name" "$slug" "$ports" "" "" 0)"
+    dbslug="$(db_slug "$slug")"
+    if ! db_safe_name "$dialect" "$db"; then
+        DB_TARGET_ERR="resolved db_name '$db' is not a safe $dialect name (refusing wildcard/traversal)"
+        return 1
+    fi
+    case "$db" in
+        *"$slug"*|*"$dbslug"*) ;;
+        *)
+            DB_TARGET_ERR="resolved db_name '$db' is not tied to this worktree's slug '$slug'"
+            return 1
+            ;;
+    esac
+    DB_TARGET_VALUE="$db"
+    return 0
+}
+
+# db_drop_allowed IDX SLUG PORTS: the drop guard. Sets DB_DROP_VALUE only when
+# wt can prove the resolved name is this worktree's own.
+db_drop_allowed() {
+    local idx="$1" slug="$2" ports="$3" name db tmpl
+    name="$(db_name_at "$idx")"
+    DB_DROP_VALUE=""
+    DB_DROP_ERR=""
+    [ -n "$slug" ] || { DB_DROP_ERR="no slug (claim/branch) in $WT_CURRENT_ROOT"; return 1; }
+    if [ "$(mode_of_path "$WT_CURRENT_ROOT")" = "main" ]; then
+        DB_DROP_ERR="refusing to drop a database from the main worktree ($WT_CURRENT_ROOT)"
+        return 1
+    fi
+    tmpl="$(cfg_db_field "$idx" db_name)"
+    db_template_is_own "$tmpl" || {
+        DB_DROP_ERR="db.$name.db_name '$tmpl' is not tied to \${slug}/\${db_slug} (refusing to drop a fixed/shared name)"
+        return 1
+    }
+    if ! db_check_target "$idx" "$slug" "$ports"; then
+        DB_DROP_ERR="$DB_TARGET_ERR"
+        return 1
+    fi
+    db="$DB_TARGET_VALUE"
+    if db_record_read "$WT_CURRENT_ROOT" "$name"; then
+        if [ "$DB_REC_SLUG" != "$slug" ]; then
+            DB_DROP_ERR="recorded slug '$DB_REC_SLUG' differs from current slug '$slug'"
+            return 1
+        fi
+        if [ "$DB_REC_NAME" != "$db" ]; then
+            DB_DROP_ERR="recorded db_name '$DB_REC_NAME' differs from resolved '$db'"
+            return 1
+        fi
+    fi
+    DB_DROP_VALUE="$db"
+    return 0
+}
+
+cmd_db_create() {
+    local name="" json=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name) [ $# -ge 2 ] || usage_error "db create: --name requires a value"; name="$2"; shift 2 ;;
+            --json) json=true; shift ;;
+            -*)     usage_error "db create: unknown option '$1'" ;;
+            *)      usage_error "db create: unexpected argument '$1'" ;;
+        esac
+    done
+    db_require_present
+    [ -z "$name" ] || db_assert_name "$name"
+    local slug ports idx dname dialect db state detail first=1 out="" rc=0
+    slug="$(env_current_slug)"
+    ports="$(env_current_ports)"
+    [ -n "$slug" ] || die "db create: cannot determine a slug (no claim and no branch-derived slug) in $WT_CURRENT_ROOT"
+    while IFS= read -r idx; do
+        [ -n "$idx" ] || continue
+        dname="$(db_name_at "$idx")"
+        dialect="$(cfg_db_field "$idx" dialect)"
+        db_check_target "$idx" "$slug" "$ports" || die "db create: $DB_TARGET_ERR"
+        db="$DB_TARGET_VALUE"
+        if [ "$dialect" = "postgres" ]; then
+            db_pg_preflight "$idx" "$slug" "$ports" || die "db create ($dname): $DB_PG_DETAIL"
+        fi
+        if [ "$(db_cmd_count "$idx" create)" -eq 0 ]; then
+            die "db create ($dname): db.$dname.create is not declared"
+        fi
+        local dex=0
+        if db_exists "$idx" "$slug" "$ports"; then dex=0; else dex=$?; fi
+        case "$dex" in
+            0)
+                state="exists"; detail="$db already exists"
+                note "db create: $dname already exists ($db)"
+                ;;
+            *)
+                if db_run_field "$idx" create "$slug" "$ports" ""; then
+                    state="created"; detail="$db created"
+                    note "db create: $dname created ($db)"
+                else
+                    state="failed"; detail="create command failed ($db)"; rc=1
+                    [ "$json" = "true" ] || die "db create ($dname): create command failed ($db)"
+                fi
+                ;;
+        esac
+        [ "$state" = "failed" ] || db_record_write "$WT_CURRENT_ROOT" "$dname" "$slug" "$db" >/dev/null 2>&1 || true
+        [ "$first" -eq 1 ] || out="$out,"
+        first=0
+        out="$out{\"name\":$(json_escape "$dname"),\"db_name\":$(json_escape "$db"),\"state\":$(json_escape "$state"),\"detail\":$(json_escape "$detail")}"
+    done < <(db_indices "$name")
+    if [ "$json" = "true" ]; then
+        printf '{"slug":%s,"databases":[%s]}\n' "$(json_escape "$slug")" "$out"
+    fi
+    return "$rc"
+}
+
+cmd_db_migrate() {
+    local name="" json=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name) [ $# -ge 2 ] || usage_error "db migrate: --name requires a value"; name="$2"; shift 2 ;;
+            --json) json=true; shift ;;
+            -*)     usage_error "db migrate: unknown option '$1'" ;;
+            *)      usage_error "db migrate: unexpected argument '$1'" ;;
+        esac
+    done
+    db_require_present
+    [ -z "$name" ] || db_assert_name "$name"
+    local slug ports idx dname dialect db state detail first=1 out="" rc=0
+    slug="$(env_current_slug)"
+    ports="$(env_current_ports)"
+    while IFS= read -r idx; do
+        [ -n "$idx" ] || continue
+        dname="$(db_name_at "$idx")"
+        dialect="$(cfg_db_field "$idx" dialect)"
+        db_check_target "$idx" "$slug" "$ports" || die "db migrate: $DB_TARGET_ERR"
+        db="$DB_TARGET_VALUE"
+        if [ "$dialect" = "postgres" ]; then
+            db_pg_preflight "$idx" "$slug" "$ports" || die "db migrate ($dname): $DB_PG_DETAIL"
+        fi
+        if [ "$(db_cmd_count "$idx" migrate)" -eq 0 ]; then
+            state="skipped"; detail="migrate not owned by wt"
+            note "db migrate: $dname skipped (db.$dname.migrate not declared)"
+        elif db_run_field "$idx" migrate "$slug" "$ports" ""; then
+            state="migrated"; detail="migrate commands finished"
+            note "db migrate: $dname migrated"
+        else
+            state="failed"; detail="migrate command failed"; rc=1
+            note "db migrate: $dname failed"
+        fi
+        [ "$first" -eq 1 ] || out="$out,"
+        first=0
+        out="$out{\"name\":$(json_escape "$dname"),\"db_name\":$(json_escape "$db"),\"state\":$(json_escape "$state"),\"detail\":$(json_escape "$detail")}"
+    done < <(db_indices "$name")
+    if [ "$json" = "true" ]; then
+        printf '{"slug":%s,"databases":[%s]}\n' "$(json_escape "$slug")" "$out"
+    fi
+    return "$rc"
+}
+
+cmd_db_backup() {
+    local name="" slug="" json=false best=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)     [ $# -ge 2 ] || usage_error "db backup: --name requires a value"; name="$2"; shift 2 ;;
+            --slug)     [ $# -ge 2 ] || usage_error "db backup: --slug requires a value"; slug="$2"; shift 2 ;;
+            --json)     json=true; shift ;;
+            --best-effort) best=true; shift ;;
+            -*)         usage_error "db backup: unknown option '$1'" ;;
+            *)          usage_error "db backup: unexpected argument '$1'" ;;
+        esac
+    done
+    db_require_present
+    [ -z "$name" ] || db_assert_name "$name"
+    [ -n "$slug" ] || slug="$(env_current_slug)"
+    [ -n "$slug" ] || die "db backup: cannot determine a slug (pass --slug)"
+    local ports idx dname dialect db archive state detail first=1 out="" rc=0
+    ports="$(env_current_ports)"
+    archive="$(db_archive_dir "$slug")"
+    while IFS= read -r idx; do
+        [ -n "$idx" ] || continue
+        dname="$(db_name_at "$idx")"
+        dialect="$(cfg_db_field "$idx" dialect)"
+        state="failed"; detail=""; db=""
+        if ! db_check_target "$idx" "$slug" "$ports"; then
+            detail="$DB_TARGET_ERR"
+            if [ "$best" = "true" ]; then
+                warn "db backup ($dname): $DB_TARGET_ERR"
+            else
+                die "db backup: $DB_TARGET_ERR"
+            fi
+            rc=1
+        else
+            db="$DB_TARGET_VALUE"
+            if [ "$(db_cmd_count "$idx" backup)" -eq 0 ]; then
+                state="skipped"; detail="backup not declared"
+                note "db backup: $dname skipped (db.$dname.backup not declared)"
+            elif ! mkdir -p "$archive" 2>/dev/null; then
+                warn "db backup: cannot create $archive"
+                state="failed"; detail="cannot create archive dir"; rc=1
+            elif db_run_field "$idx" backup "$slug" "$ports" "$archive" "$best"; then
+                state="ok"; detail="$archive"
+                note "db backup: $dname -> $archive"
+            else
+                state="failed"; detail="backup command failed"; rc=1
+            fi
+        fi
+        [ "$first" -eq 1 ] || out="$out,"
+        first=0
+        out="$out{\"name\":$(json_escape "$dname"),\"db_name\":$(json_escape "$db"),\"state\":$(json_escape "$state"),\"detail\":$(json_escape "$detail")}"
+    done < <(db_indices "$name")
+    if [ "$json" = "true" ]; then
+        printf '{"slug":%s,"archive":%s,"databases":[%s]}\n' \
+            "$(json_escape "$slug")" "$(json_escape "$archive")" "$out"
+    fi
+    return "$rc"
+}
+
+cmd_db_status() {
+    local name="" json=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name) [ $# -ge 2 ] || usage_error "db status: --name requires a value"; name="$2"; shift 2 ;;
+            --json) json=true; shift ;;
+            -*)     usage_error "db status: unknown option '$1'" ;;
+            *)      usage_error "db status: unexpected argument '$1'" ;;
+        esac
+    done
+    db_require_present
+    [ -z "$name" ] || db_assert_name "$name"
+    local slug ports idx dname dialect db reachable=1 exists=2 ok detail first=1 out="" allok=1 target_ok
+    slug="$(env_current_slug)"
+    ports="$(env_current_ports)"
+    [ "$json" = "true" ] || printf 'databases — %s\n' "$WT_CURRENT_ROOT"
+    while IFS= read -r idx; do
+        [ -n "$idx" ] || continue
+        dname="$(db_name_at "$idx")"
+        dialect="$(cfg_db_field "$idx" dialect)"
+        db=""; target_ok=0
+        if db_check_target "$idx" "$slug" "$ports"; then
+            db="$DB_TARGET_VALUE"; target_ok=1
+        else
+            db="$(db_resolve_name "$dname" "$slug" "$ports" "" "" 0 2>/dev/null || true)"
+        fi
+        reachable=1
+        if [ "$dialect" = "postgres" ]; then
+            db_pg_preflight "$idx" "$slug" "$ports" || reachable=0
+        fi
+        if [ "$target_ok" -eq 1 ]; then
+            exists=2
+            if db_exists "$idx" "$slug" "$ports"; then exists=0; else exists=$?; fi
+        else
+            exists=2
+        fi
+        ok=0
+        if [ "$target_ok" -eq 1 ] && [ "$reachable" -eq 1 ] && [ "$exists" -eq 0 ]; then ok=1; fi
+        [ "$ok" -eq 1 ] || allok=0
+        if [ "$target_ok" -eq 0 ]; then
+            detail="$DB_TARGET_ERR"
+        elif [ "$dialect" = "postgres" ]; then
+            if [ "$reachable" -eq 1 ]; then detail="$DB_PG_DETAIL; exists=$( [ "$exists" -eq 0 ] && printf yes || printf no )";
+            else detail="$DB_PG_DETAIL"; fi
+        else
+            detail="$(db_sqlite_path "$idx" "$slug" "$ports" 2>/dev/null || printf '%s' "$db"); exists=$( [ "$exists" -eq 0 ] && printf yes || printf no )"
+        fi
+        [ "$first" -eq 1 ] || out="$out,"
+        first=0
+        out="$out{\"name\":$(json_escape "$dname"),\"dialect\":$(json_escape "$dialect"),\"db_name\":$(json_escape "$db"),\"reachable\":$(bool_json "$reachable"),\"exists\":$(bool_json "$([ "$exists" -eq 0 ] && printf 1 || printf 0)"),\"ok\":$(bool_json "$ok"),\"detail\":$(json_escape "$detail")}"
+        if [ "$json" != "true" ]; then
+            printf '  %-12s %-6s %-4s %s\n' "$dname" "$dialect" "$(bool_json "$ok")" "$detail"
+        fi
+    done < <(db_indices "$name")
+    if [ "$json" = "true" ]; then
+        printf '{"worktree":%s,"slug":%s,"ok":%s,"databases":[%s]}\n' \
+            "$(json_escape "$WT_CURRENT_ROOT")" "$(json_escape "$slug")" "$(bool_json "$allok")" "$out"
+    fi
+    [ "$allok" -eq 1 ] || exit 1
+    return 0
+}
+
+cmd_db_drop() {
+    local name="" json=false best=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)        [ $# -ge 2 ] || usage_error "db drop: --name requires a value"; name="$2"; shift 2 ;;
+            --json)        json=true; shift ;;
+            --best-effort) best=true; shift ;;
+            -*)            usage_error "db drop: unknown option '$1'" ;;
+            *)             usage_error "db drop: unexpected argument '$1'" ;;
+        esac
+    done
+    db_require_present
+    [ -z "$name" ] || db_assert_name "$name"
+    local slug ports idx dname dialect db state detail first=1 out="" rc=0 exists
+    slug="$(env_current_slug)"
+    ports="$(env_current_ports)"
+    # A main worktree owns the shared checkout, never a per-worktree db. This
+    # is checked before any block so teardown in main can never touch it.
+    if [ "$(mode_of_path "$WT_CURRENT_ROOT")" = "main" ]; then
+        if [ "$best" = "true" ]; then
+            note "db drop: skipped (main worktree $WT_CURRENT_ROOT)"
+            [ "$json" = "true" ] && printf '{"slug":%s,"databases":[],"skipped":"main"}\n' "$(json_escape "$slug")"
+            return 0
+        fi
+        die "db drop: refusing to drop a database from the main worktree ($WT_CURRENT_ROOT)"
+    fi
+    while IFS= read -r idx; do
+        [ -n "$idx" ] || continue
+        dname="$(db_name_at "$idx")"
+        dialect="$(cfg_db_field "$idx" dialect)"
+        state="skipped"; detail=""; db=""
+        if [ "$(db_cmd_count "$idx" drop)" -eq 0 ]; then
+            detail="drop not declared"
+            note "db drop: $dname skipped (db.$dname.drop not declared)"
+        elif ! db_drop_allowed "$idx" "$slug" "$ports"; then
+            if [ "$best" = "true" ]; then
+                warn "db drop ($dname): $DB_DROP_ERR -- skipped"
+                state="skipped"; detail="$DB_DROP_ERR"
+            else
+                note "db drop ($dname): $DB_DROP_ERR"
+                rc=1; state="refused"; detail="$DB_DROP_ERR"
+            fi
+        else
+            db="$DB_DROP_VALUE"
+            exists=2
+            if db_exists "$idx" "$slug" "$ports"; then exists=0; else exists=$?; fi
+            if [ "$exists" -eq 1 ]; then
+                state="absent"; detail="$db already absent"
+                note "db drop: $dname already absent ($db)"
+                db_record_remove "$WT_CURRENT_ROOT" "$dname"
+            else
+                if db_run_field "$idx" drop "$slug" "$ports" "" "$best"; then
+                    state="dropped"; detail="$db dropped"
+                    note "db drop: $dname dropped ($db)"
+                    db_record_remove "$WT_CURRENT_ROOT" "$dname"
+                else
+                    state="failed"; detail="drop command failed"
+                    rc=1
+                fi
+            fi
+        fi
+        [ "$first" -eq 1 ] || out="$out,"
+        first=0
+        out="$out{\"name\":$(json_escape "$dname"),\"db_name\":$(json_escape "$db"),\"state\":$(json_escape "$state"),\"detail\":$(json_escape "$detail")}"
+    done < <(db_indices "$name")
+    if [ "$json" = "true" ]; then
+        printf '{"slug":%s,"databases":[%s]}\n' "$(json_escape "$slug")" "$out"
+    fi
+    [ "$rc" -eq 0 ] || [ "$best" = "true" ] || return "$rc"
+    return 0
+}
+
+cmd_db() {
+    require_project
+    validate_config
+    local sub="${1:-}"
+    [ $# -ge 1 ] && shift || true
+    case "$sub" in
+        create)  cmd_db_create "$@" ;;
+        migrate) cmd_db_migrate "$@" ;;
+        backup)  cmd_db_backup "$@" ;;
+        status)  cmd_db_status "$@" ;;
+        drop)    cmd_db_drop "$@" ;;
+        ''|*)    usage_error "db requires a subcommand (create|migrate|backup|status|drop)" ;;
+    esac
+}
+
+# ============================================================================
 # wt check — declarative health probes ([[check]] manifest)
 # ============================================================================
 
@@ -3658,13 +4805,24 @@ cmd_check() {
     done
     local n
     n="$(cfg_check_count)"
-    [ "${n:-0}" -gt 0 ] || die "no [[check]] probes declared in $(config_file)"
+    [ "${n:-0}" -gt 0 ] || cfg_db_present \
+        || die "no [[check]] probes or [[db]] blocks declared in $(config_file)"
     # --name narrows the run to one probe (used by `wt proc start`'s wait loop,
     # which must not pay for every other probe on each poll); a typo is an error,
-    # not an empty pass.
+    # not an empty pass. Database preflight probes are named db:<manifest name>.
+    local only_db=""
     if [ -n "$only" ]; then
-        check_names | grep -Fxq "$only" \
-            || die "check: no [[check]] probe named '$only' in $(config_file)"
+        case "$only" in
+            db:*)
+                only_db="${only#db:}"
+                db_index_by_name "$only_db" >/dev/null \
+                    || die "check: no [[db]] block named '$only_db' in $(config_file)"
+                ;;
+            *)
+                check_names | grep -Fxq "$only" \
+                    || die "check: no [[check]] probe named '$only' in $(config_file)"
+                ;;
+        esac
     fi
 
     local slug ports
@@ -3717,6 +4875,28 @@ cmd_check() {
         i=$((i + 1))
     done
 
+    # Database preflight: reachability + version for postgres (so setup fails
+    # before a migration), file presence for sqlite. Named db:<manifest name>
+    # so --name can target one block.
+    if cfg_db_present; then
+        local dbidx dbname dbok=0 dbdetail
+        while IFS= read -r dbidx; do
+            [ -n "$dbidx" ] || continue
+            dbname="$(db_name_at "$dbidx")"
+            if [ -n "$only" ] && [ "$only" != "db:$dbname" ]; then
+                continue
+            fi
+            if db_probe "$dbidx" "$slug" "$ports"; then dbok=1; else dbok=0; allok=0; fi
+            dbdetail="$DB_PROBE_DETAIL"
+            [ "$dbok" -eq 1 ] || allok=0
+            [ "$json_first" -eq 1 ] || json_checks="$json_checks,"
+            json_first=0
+            json_checks="$json_checks{\"name\":$(json_escape "db:$dbname"),\"ok\":$(bool_json "$dbok"),\"detail\":$(json_escape "$dbdetail")}"
+            human_lines="$human_lines$(printf '  %-12s %-4s %s' "db:$dbname" "$(bool_json "$dbok")" "$dbdetail")
+"
+        done < <(db_indices "$only_db")
+    fi
+
     if [ "$json" = "true" ]; then
         printf '{"worktree":%s,"slug":%s,"ok":%s,"checks":[%s]}\n' \
             "$(json_escape "$WT_CURRENT_ROOT")" "$(json_escape "$slug")" "$(bool_json "$allok")" "$json_checks"
@@ -3766,7 +4946,18 @@ cmd_teardown() {
     local proc_out
     proc_out="$(cmd_proc_stop --cwd "$root" --json 2>/dev/null || printf '{"stopped":[],"killed":[]}')"
 
-    # 2. archive the declared paths (best-effort)
+    # 2. snapshot databases into the archive dir (best-effort; must happen
+    # before drop, and shares the archive root with the file snapshot below).
+    local db_backup_state="skip"
+    if cfg_db_present && [ -n "$slug" ]; then
+        if cmd_db_backup --slug "$slug" --best-effort >/dev/null 2>&1; then
+            db_backup_state="ok"
+        else
+            db_backup_state="failed"
+        fi
+    fi
+
+    # 3. archive the declared paths (best-effort)
     local apaths archive_state="skip" p
     apaths="$(cfg_task_archive_paths)"
     if [ -n "$slug" ] && [ -n "${apaths//[[:space:]]/}" ]; then
@@ -3778,23 +4969,37 @@ cmd_teardown() {
         archive_state="ok"
     fi
 
-    # 3. release this slug's port rows
+    # 4. drop this worktree's own database/schema (best-effort; the guard lives
+    # in cmd_db_drop and never drops a fixed/shared name or anything in main).
+    local db_drop_state="skip"
+    if cfg_db_present && [ -n "$slug" ]; then
+        if cmd_db_drop --best-effort >/dev/null 2>&1; then
+            db_drop_state="ok"
+        else
+            db_drop_state="failed"
+        fi
+    fi
+
+    # 5. release this slug's port rows
     local release_state="skip"
     if [ -n "$slug" ]; then
         cmd_port_release --slug "$slug" >/dev/null 2>&1 || true
         release_state="ok"
     fi
 
-    # 4. drop the identity claim
+    # 6. drop the identity claim
     rm -f "$(task_claim_file "$root")" 2>/dev/null || true
+    rmdir "$root/.wt/db" 2>/dev/null || true
     rmdir "$root/.wt" 2>/dev/null || true
 
     if [ "$json" = "true" ]; then
-        printf '{"slug":%s,"proc":%s,"archive":%s,"portRelease":%s,"claimClear":"ok"}\n' \
-            "$(json_escape "$slug")" "$proc_out" "$(json_escape "$archive_state")" "$(json_escape "$release_state")"
+        printf '{"slug":%s,"proc":%s,"dbBackup":%s,"archive":%s,"dbDrop":%s,"portRelease":%s,"claimClear":"ok"}\n' \
+            "$(json_escape "$slug")" "$proc_out" "$(json_escape "$db_backup_state")" \
+            "$(json_escape "$archive_state")" "$(json_escape "$db_drop_state")" \
+            "$(json_escape "$release_state")"
         return 0
     fi
-    info "teardown complete: slug=${slug:-<none>} (proc-stop ok, archive $archive_state, port-release $release_state, claim clear)"
+    info "teardown complete: slug=${slug:-<none>} (proc-stop ok, db-backup $db_backup_state, archive $archive_state, db-drop $db_drop_state, port-release $release_state, claim clear)"
     return 0
 }
 
@@ -3923,6 +5128,12 @@ case "$phase" in
         if "$WT_BIN" config has env; then
           "$WT_BIN" env copy --from-main || true
         fi
+      fi
+      # Declarative database lifecycle (only when the project declared [[db]]).
+      # Migrate/seed stay project-owned: put them in extra.sh if the project
+      # needs them, unless they are truly tied to worktree creation.
+      if "$WT_BIN" config has db; then
+        "$WT_BIN" db create || true
       fi
     fi
     ;;
@@ -4108,11 +5319,13 @@ types = ["task"]
 # archive_max_bytes = 26214400
 
 # ---- optional env plane (wt env materialize|show|get|copy) -------------------
-# Declarative per-app env files. wt implements a file chain plus three
-# placeholder classes (${slug}, ${port.<role>}, ${env.<KEY>}); it never
-# implements project-specific dotenv semantics. Active only when [env] exists.
+# Declarative per-app env files. wt implements a file chain plus a small
+# placeholder language (${slug}, ${port.<role>}, ${env.<KEY>}, and the db
+# forms ${db_name} / ${db.<name>.<field>}); it never implements project-specific
+# dotenv semantics. Active only when [env] exists.
 #[env.gateway]
 # dir            = "apps/gateway"
+# db             = "default"              # bind to a [[db]] for ${db_name}
 # files          = [".env", ".env.development", ".env.development.local"]
 # seed           = "scripts/seed/gateway.env"   # read from the main worktree
 # seed_target    = ".env.development"           # where the seed is written
@@ -4146,6 +5359,43 @@ types = ["task"]
 # dir   = "apps/gateway"
 # cmd   = "vp run dev"
 # check = "api"
+
+# ---- optional declarative database lifecycle (wt db) -----------------------
+# A [[db]] block declares command lines; wt owns lifecycle ordering, ${slug} /
+# ${db_name} / ${archive} substitution, idempotent create, the drop guard and
+# best-effort teardown. No SQL lives in wt. One block per resource; --name
+# selects a block (the default is "default").
+#
+# Placeholders: ${slug}, ${db_slug} (identifier-safe slug), ${db_name},
+# ${archive} (teardown snapshot dir), ${port.<role>}, ${env.<KEY>},
+# ${db.<name>.<field>}. `drop` is refused unless db_name contains ${slug} or
+# ${db_slug} and each drop command line references ${db_name}/${db_slug} (or
+# $WT_DB_NAME/$WT_DB_SLUG); the main worktree never drops. `migrate` is
+# optional and belongs to the project unless it is truly lifecycle-tied.
+#[[db]]
+# name    = "default"
+# dialect = "postgres"                  # postgres | sqlite
+# scope   = "database"                  # database | schema (shared db)
+# db_name = "loom_${db_slug}"
+## database = "loom"                    # required for scope = "schema"
+## host = "localhost"                   # optional; ambient PG* env is used
+## port = 5432
+## user = "postgres"
+## maintenance_db = "postgres"
+## min_version = 14                     # server_version_num gate (default 14)
+# url     = "postgresql://localhost:5432/${db_name}"
+# create  = ["createdb ${db_name}"]
+# migrate = []                         # empty = project-owned (no-op)
+# backup  = ["pg_dump -Fc -f ${archive}/${db_name}.dump ${db_name}"]
+# drop    = ["dropdb --if-exists ${db_name}"]
+#
+# SQLite (keeps the R1 file-based shape):
+#[[db]]
+# name    = "default"
+# dialect = "sqlite"
+# db_name = "data/loom.${slug}.sqlite"
+# create  = ["mkdir -p data && touch ${db_name}"]
+# drop    = ["rm -f ${db_name}"]
 EOF
     } > "$target"
 
@@ -4178,6 +5428,7 @@ main() {
         task)    cmd_task "$@" ;;
         port)    cmd_port "$@" ;;
         proc)    cmd_proc "$@" ;;
+        db)      cmd_db "$@" ;;
         archive) cmd_archive "$@" ;;
         env)     cmd_env "$@" ;;
         check)   cmd_check "$@" ;;
@@ -4210,10 +5461,11 @@ Toolkit
   port claim|release|list          per-project port registry
   proc start [role...]             start [proc.<role>] detached, wait on its [[check]]
   proc stop --cwd DIR              stop processes whose cwd is inside DIR
+  db create|migrate|backup|status|drop  declarative database lifecycle ([[db]])
   archive --slug S --path P...     snapshot paths for a worktree
   env materialize|show|get|copy    declarative env plane ([env] manifest)
-  check [--name NAME] [--json]     run declarative health probes ([[check]])
-  teardown [--json]                canonical teardown (stop/archive/release/clear)
+  check [--name NAME] [--json]     run declarative health probes ([[check]]) + db preflight
+  teardown [--json]                canonical teardown (stop/snapshot/drop/release/clear)
   assert --mode M                  assert the current worktree's mode
 
 Lifecycle helpers
