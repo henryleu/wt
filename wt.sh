@@ -10,7 +10,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly WT_VERSION="0.2.2"
+readonly WT_VERSION="0.3.0"
 readonly WT_PROG="wt"
 readonly LOCK_TIMEOUT="${WT_LOCK_TIMEOUT:-60}" # seconds before failing lock wait
 readonly WT_COMMIT_TIMEOUT="${WT_COMMIT_TIMEOUT:-300}" # seconds per coding-agent call for wt commit
