@@ -2484,8 +2484,17 @@ setup/teardown hooks (driven by an orchestrator) can call.
   archive/<project_key>/<slug>/   wt archive snapshot target
 ```
 
-Slot worktrees and the main checkout stay **stateless** — no claim file is ever
-created for them.
+Slot worktrees and the main checkout stay **stateless** — `wt` never creates a
+claim file for either. From there the two diverge, and that difference *is* the
+safety property: only the MAIN checkout may resolve `${port.<role>}` from the env
+plane (a `[env.<app>.values]` entry whose template is exactly `${port.<role>}`,
+valued from that app's tracked env chain, `wt` ≥ 0.3.1). A slot worktree without a
+claim gets no such fallback — its probes keep failing until it has a claim, because
+otherwise two slots would borrow the same fixed ports and collide. The main
+checkout still never acquires a claim automatically, so `wt db drop` keeps
+refusing it. If a stray claim is present there anyway, the claim wins as it does
+everywhere else: `wt current`, `wt env show`, `wt check` and `wt proc start` all
+read one precedence (`env_current_ports`).
 
 **Claim schema (v1).** `{"version":1,<?>}`; required `slug`, `branch`,
 `created_at`; optional `type`, `label`; `ports` is an arbitrary `role → port`

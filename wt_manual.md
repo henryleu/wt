@@ -1157,7 +1157,8 @@ The command owns its own logging (`wt proc start` sends stdout/stderr to
 — and list that file in `[task].archive_paths` to have teardown snapshot it.
 `wt proc start` fails fast when a probe still holds an unresolvable `${...}`
 placeholder (e.g. `${port.gateway}` in a worktree whose claim lacks that role),
-because such a probe can never pass.
+because such a probe can never pass. The main checkout has no claim, so there
+the port comes from the env plane instead (see 16.5).
 
 ### 16.3 Writing a teardown hook
 
@@ -1207,6 +1208,12 @@ DB   = "data/g.${slug}.sqlite"      # the slug
   `${db_name}` and `${db.<name>.<field>}`. Bind the app with `db = "default"`
   (or use the explicit `${db.default.url}`) to derive a connection string from
   a `[[db]]` block instead of duplicating it.
+- **`${port.<role>}` in the main checkout** comes from the manifest, not from a
+  claim: a value whose template is *exactly* `${port.<role>}` declares that
+  role's port, and the number is read from the app's `files` chain (its tracked
+  `.env`). Embedded forms such as `"http://localhost:${port.api}"` are consumers
+  and never a source; two exact declarations disagreeing is an error. Slot
+  worktrees without a claim get no such fallback.
 - `wt env materialize` writes the seed and generated values, never clobbering an
   existing file unless `--force`.
 - `wt env show`/`get` read the `files` chain (last file wins), matching how the

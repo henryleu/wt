@@ -10,7 +10,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly WT_VERSION="0.3.0"
+readonly WT_VERSION="0.3.1"
 readonly WT_PROG="wt"
 readonly LOCK_TIMEOUT="${WT_LOCK_TIMEOUT:-60}" # seconds before failing lock wait
 readonly WT_COMMIT_TIMEOUT="${WT_COMMIT_TIMEOUT:-300}" # seconds per coding-agent call for wt commit
@@ -1916,13 +1916,23 @@ cmd_current() {
     mode="$(mode_of_path "$WT_CURRENT_ROOT")"
 
     if [ "$json" = "true" ]; then
-        local portsj="{}" slugj="" rc=0
+        local portsj="{}" slugj="" rc=0 mports=""
         if [ "$mode" = "task" ]; then
             task_claim_load "$WT_CURRENT_ROOT" || rc=$?
             if [ "$rc" -eq 0 ]; then
                 portsj="$(ports_json "$TASK_PORTS")"
                 slugj="$(json_escape "$TASK_SLUG")"
             fi
+        elif [ "$mode" = "main" ]; then
+            # The main checkout normally has no claim; report the ports derived
+            # from the env plane. Two things matter here: ask `env_current_ports`
+            # (not main_ports_from_env) so a claim still wins exactly as it does
+            # for `wt check` / `wt proc start`, and capture the result in its own
+            # statement. Inside a nested $(...) a fatal derivation error only kills
+            # the inner subshell, which left `wt current` printing "ports":{} and
+            # exiting 0 while every other command failed.
+            mports="$(env_current_ports)" || die "current: cannot resolve the main-checkout ports (reason above)"
+            portsj="$(ports_json "$mports")"
         fi
         printf '{"workspace":%s,"slot":%s,"branch":%s,"main_branch":%s,"main_worktree":%s,"mode":%s' \
             "$(json_escape "$slot")" "$(json_escape "$slot")" "$(json_escape "$br")" \
@@ -1945,6 +1955,10 @@ cmd_current() {
             printf 'slug=%s\n' "$TASK_SLUG"
             printf '%s\n' "$TASK_PORTS" | port_print_pairs
         fi
+    elif [ "$mode" = "main" ]; then
+        local hmports=""
+        hmports="$(env_current_ports)" || die "current: cannot resolve the main-checkout ports (reason above)"
+        printf '%s\n' "$hmports" | port_print_pairs
     fi
 }
 
@@ -3299,7 +3313,7 @@ proc_assert_probe_resolvable() {
         expanded="$(env_expand_str "$raw" "$slug" "$ports" "" 0)"
         case "$expanded" in
             *'${'*)
-                proc_error "proc start: $role probe '$chk' cannot pass: $field still holds a placeholder after expansion ($expanded) -- \${port.<role>} needs a claim that carries the role"
+                proc_error "proc start: $role probe '$chk' cannot pass: $field still holds a placeholder after expansion ($expanded) -- \${port.<role>} needs a claim that carries the role, or (in the main checkout) an exact \${port.<role>} value in [env.<app>.values] with that key set in the app's tracked .env"
                 ;;
         esac
     done
@@ -3338,7 +3352,11 @@ cmd_proc_start() {
     proc_validate_roles $want_roles || proc_error "$(one_line "$PROC_ERR")"
     local roles="$REQ_ROLES" role slug ports
     slug="$(env_current_slug)"
-    ports="$(env_current_ports)"
+    # A fatal derivation error has already reached stderr from inside $(...).
+    # The --json consumer is still owed exactly one document (see proc_error), so
+    # report through it instead of aborting with an empty stdout.
+    ports="$(env_current_ports)" \
+        || proc_error "proc start: cannot resolve ports for this worktree (reason above)"
     for role in $roles; do
         proc_assert_probe_resolvable "$role" "$slug" "$ports"
     done
@@ -3634,14 +3652,90 @@ env_current_slug() {
     return 0
 }
 
-# env_current_ports: claim ports ("role<TAB>port" lines) or empty. Always
-# returns 0 so a bare `ports="$(env_current_ports)"` is safe under set -e when
-# no claim exists (slots use the env plane without a claim).
+# env_current_ports: claim ports ("role<TAB>port" lines) or, in the MAIN
+# checkout, the ports derived from the env plane (see main_ports_from_env). A
+# claim always wins, in every mode.
+#
+# "Nothing resolved" is not an error — an empty result means no role was declared
+# — but a MISCONFIGURED declaration exits 1 after printing why. Callers therefore
+# have to check the status; a bare `ports="$(env_current_ports)"` is not assumed
+# safe under set -e.
 env_current_ports() {
     local rc=0
     task_claim_load "$WT_CURRENT_ROOT" 2>/dev/null || rc=$?
-    if [ "$rc" -eq 0 ]; then printf '%s' "$TASK_PORTS"; fi
+    if [ "$rc" -eq 0 ]; then printf '%s' "$TASK_PORTS"; return 0; fi
+    main_ports_from_env
     return 0
+}
+
+# port_role_from_exact_template TEMPLATE: print <role> when TEMPLATE is EXACTLY
+# "${port.<role>}", else return 1. Embedded occurrences ("http://localhost:
+# ${port.gateway}") are consumers of a port, not its declaration: their value is
+# a URL, so treating them as a source would hand a URL to the port machinery.
+port_role_from_exact_template() {
+    local raw="$1" role
+    case "$raw" in
+        '${port.'*'}') role="${raw#\$\{port\.}"; role="${role%\}}" ;;
+        *) return 1 ;;
+    esac
+    valid_role_name "$role" || return 1
+    printf '%s' "$role"
+}
+
+# main_ports_from_env: "role<TAB>port" lines for the MAIN checkout, derived from
+# the [env] manifest and the tracked .env chain.
+#
+# Why this exists: the main checkout has no claim (design.md keeps it stateless
+# so `wt db drop` can refuse it), so ${port.<role>} could never resolve there and
+# every [[check]] / [proc.<role>] probe was unusable. The env plane already names
+# each app's port variable:
+#
+#   [env.api.values]     PORT     = "${port.api}"
+#   [env.console.values] DEV_PORT = "${port.console}"
+#
+# so an EXACT ${port.<role>} template declares that role's port, and the value
+# comes from the app's own env chain -- the same variable the app reads, which
+# is why this cannot drift from what the app binds.
+#
+# Main mode ONLY: a slot worktree without a claim must keep failing instead of
+# borrowing the main checkout's fixed ports (two slots would collide).
+main_ports_from_env() {
+    [ "$(mode_of_path "$WT_CURRENT_ROOT")" = "main" ] || return 0
+    cfg_env_present || return 0
+    local app key raw role out val src decls="" prior prior_port prior_src ports="" r p
+    while IFS= read -r app; do
+        [ -n "$app" ] || continue
+        while IFS= read -r key; do
+            [ -n "$key" ] || continue
+            raw="$(cfg_env_value "$app" "$key")"
+            role="$(port_role_from_exact_template "$raw")" || continue
+            out="$(env_chain_get "$app" "$key" "$WT_CURRENT_ROOT" 2>/dev/null)" || continue
+            val="${out%%$'\t'*}"
+            src="${out#*$'\t'}"
+            case "$val" in
+                ''|*[!0-9]*)
+                    die "main-mode port: [env.$app.values] $key declares \${port.$role} but the env chain resolves it to '$val' ($src), which is not a port number"
+                    ;;
+            esac
+            [ "$val" -ge 1 ] && [ "$val" -le 65535 ] \
+                || die "main-mode port: [env.$app.values] $key declares \${port.$role} but the env chain resolves it to '$val' ($src), which is out of range"
+            prior=""
+            [ -n "$decls" ] && prior="$(printf '%s\n' "$decls" | awk -F'\t' -v r="$role" '$1==r {print; exit}')"
+            if [ -n "$prior" ]; then
+                prior_port="$(printf '%s' "$prior" | cut -f2)"
+                prior_src="$(printf '%s' "$prior" | cut -f3)"
+                [ "$prior_port" = "$val" ] && continue
+                die "main-mode port: role '$role' is declared as $prior_port ($prior_src) and as $val ([env.$app.values] $key from $src) -- keep exactly one"
+            fi
+            decls="${decls}${role}	${val}	[env.${app}.values] ${key} from ${src}
+"
+        done < <(cfg_env_value_keys "$app")
+    done < <(cfg_env_apps)
+    while IFS=$'\t' read -r r p _src; do
+        [ -n "$r" ] || continue
+        ports="$(ports_set "$ports" "$r" "$p")"
+    done <<< "$decls"
+    printf '%s' "$ports"
 }
 
 # env_key_from_file FILE KEY: last assignment of KEY (quotes stripped).

@@ -205,6 +205,20 @@ Defaults: `main_branch=develop`, `worktree.base=../worktrees`,
 `task.archive_budget=60`, `task.archive_max_bytes=26214400`. `[env]`,
 `[[check]]`, `[proc]`, and `[[db]]` are opt-in (absent = inactive).
 
+### Ports in the main checkout
+
+The main worktree has no claim (it stays stateless so `wt db drop` can refuse
+it), yet its `[[check]]` / `[proc.<role>]` probes use `${port.<role>}`. In
+`mode=main` those ports are derived from the env plane instead: a `[env.<app>]
+.values` entry whose template is **exactly** `${port.<role>}` declares that
+role's port, and the number is read from that app's own `files` chain — the same
+variable the app binds, so the two cannot drift. Templates that merely embed a
+port (`LOOM_API_URL = "http://localhost:${port.api}"`) are consumers and are
+ignored. Two exact declarations of one role with different values is an error.
+
+Slot worktrees without a claim do **not** get this fallback (two slots would
+borrow the same fixed ports): they still fail on the unresolved placeholder.
+
 Supported placeholders in patterns: `${project_name}`, `${slot}`. Unknown
 placeholders are an error.
 
